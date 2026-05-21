@@ -581,16 +581,92 @@ logs/telegram.log
 - 每月重新评估 ARIMA 参数、训练窗口和置信度阈值。
 - 遇到剧烈行情、交易所接口变化或信号连续失效时，暂停实时提醒并重新回测。
 
-## 12. 风险提示
+## 12. 测试方案
 
-ARIMA 是线性统计模型，对短周期加密市场中的突发消息、非线性波动和盘口冲击捕捉能力有限。该工具只能作为辅助提醒，不能作为稳定盈利保证。
+项目使用 `pytest`，所有测试命令均在 `arima-env` 中执行。
 
-上线前必须确认：
+### 12.1 运行方式
 
-- 回测没有未来函数。
-- Telegram 推送只作为人工决策参考。
-- 用户自行承担事件合约参与风险。
-- 工具不保存明文敏感信息。
-- 所有使用行为符合当地监管和 Binance 服务条款。
+```powershell
+conda activate arima-env
+cd C:\dev\program\event
+pytest
+```
 
-第一版应以“少发、准发、可解释”为原则。宁可输出更多“观望”，也不要为了提高信号数量而降低置信度门槛。
+按模块运行示例：
+
+```powershell
+pytest tests/test_config.py -v
+pytest tests/test_backtest.py -v
+pytest tests/test_telegram.py -v
+```
+
+### 12.2 测试覆盖范围
+
+| 模块 | 测试文件 | 覆盖要点 |
+|------|----------|----------|
+| 配置 | `tests/test_config.py` | `.env` 解析、校验、敏感项缺失 |
+| 历史下载 | `tests/test_download_klines.py` | 分页、去重、时间连续性 |
+| 实时采集 | `tests/test_collect_live.py` | REST 轮询、盘口字段、重试 |
+| 特征工程 | `tests/test_features.py` | 无未来泄露、标签边界 |
+| ARIMA | `tests/test_arima_predictor.py` | 固定阶数预测、失败降级 |
+| 信号引擎 | `tests/test_signal_engine.py` | 置信度、冷却、价差过滤 |
+| 滚动回测 | `tests/test_backtest.py` | 无未来函数、指标汇总 |
+| Telegram | `tests/test_telegram.py` | 消息格式、重试、dry-run |
+| 实时循环 | `tests/test_live_runner.py` | 单轮预测、健康检查 |
+| 应用入口 | `tests/test_app.py` | CLI、dry-run 解析、单轮冒烟 |
+
+Telegram 与 Binance HTTP 调用在测试中默认 **mock**，不向真实 API 发请求。
+
+### 12.3 验收标准
+
+- 全量 `pytest` 通过。
+- 特征与回测测试能拦截未来数据泄露。
+- Telegram 消息模板包含「不自动下单」「人工确认」文案。
+- 新增模块应同步补充对应 `tests/test_*.py`。
+
+## 13. README 与文档
+
+项目根目录 `README.md` 为使用主文档，需包含以下章节（已实现）：
+
+1. **环境准备**：Conda 创建/激活 `arima-env`、安装依赖、验证。
+2. **`.env` 配置**：复制 `.env.example`、变量说明表、最小配置示例。
+3. **历史数据下载**：`download_klines` 命令与下载后检查项。
+4. **回测**：`run_backtest` 命令、结果解读、上线前门槛。
+5. **实时运行**：dry-run → 真实推送的两步流程与 CLI 参数。
+6. **Telegram 测试**：Token/Chat ID 获取、`telegram --test` 命令。
+7. **日志查看**：`logs/*.log` 分工与排查顺序。
+8. **测试**：`pytest` 全量与分模块命令。
+9. **常见问题**：conda、限频、回测、模型失败、Telegram、无信号等。
+10. **风险提示**：摘要并链接 `docs/RISK_DISCLAIMER.md`。
+
+## 14. 风险提示与免责声明
+
+**核心声明（必须在 README 与风险文档中醒目展示）：**
+
+> **本工具只提供预测提醒，不构成投资建议，也不自动下单。**
+
+完整条款见 [docs/RISK_DISCLAIMER.md](RISK_DISCLAIMER.md)。摘要如下：
+
+### 14.1 工具定位
+
+- 仅根据公开市场数据输出「涨 / 跌 / 观望」类 **预测提醒**。
+- 置信度达标时通过 Telegram 通知用户。
+- **不**连接任何下单接口，**不**代替用户完成开仓、平仓或资金操作。
+
+### 14.2 不构成投资建议
+
+- 所有输出均为统计模型推断，不代表对未来价格的承诺或推荐。
+- 历史回测胜率不保证未来有效。
+- 用户须在充分理解风险后 **人工确认** 每一条信号。
+
+### 14.3 技术与合规局限
+
+- ARIMA 对短周期加密市场的突发消息、非线性波动和盘口冲击捕捉能力有限。
+- 回测必须无未来函数；样本过短或参数过拟合会导致虚高胜率。
+- 用户自行承担事件合约参与风险，遵守当地监管与 Binance 服务条款。
+- 敏感配置仅存于 `.env`，不得提交 git。
+
+### 14.4 运营原则
+
+第一版以「少发、准发、可解释」为原则。宁可输出更多「观望」，也不要为提高信号数量而降低置信度门槛。出现异常行情、连续失效或接口变更时，应暂停实时提醒并重新回测。
