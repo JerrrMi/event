@@ -85,16 +85,41 @@ event/
   README.md
 ```
 
-## 后续使用（待实现）
+## 下载历史 K 线
 
-以下命令将在各阶段实现后可用。所有命令均需在 `arima-env` 中执行。
-
-### 下载历史 K 线
+从 Binance 公开 API 分页下载 1 分钟 K 线，自动去重并检查时间连续性，保存到 `data/raw/`。所有命令均需在 `arima-env` 中执行。
 
 ```powershell
 conda activate arima-env
 python -m src.data.download_klines --symbol BTCUSDT --interval 1m --start 2026-01-01 --end 2026-02-01
 ```
+
+下载约 30 天数据示例：
+
+```powershell
+conda activate arima-env
+python -m src.data.download_klines --symbol BTCUSDT --interval 1m --start 2026-01-01 --end 2026-01-31
+```
+
+可选参数：
+
+- `--market spot|futures`：数据源（默认读取 `.env` 中 `BINANCE_MARKET`）
+- `--output-dir`：输出目录（默认 `data/raw`）
+- `--min-interval 0.2`：请求间隔秒数，用于限频
+- `-v`：输出调试日志
+
+输出文件：`data/raw/BTCUSDT_1m.csv`
+
+运行测试：
+
+```powershell
+conda activate arima-env
+pytest tests/test_download_klines.py -v
+```
+
+## 后续使用（待实现）
+
+以下命令将在各阶段实现后可用。所有命令均需在 `arima-env` 中执行。
 
 ### 运行回测
 
