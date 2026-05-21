@@ -117,6 +117,46 @@ conda activate arima-env
 pytest tests/test_download_klines.py -v
 ```
 
+## 实时行情采集
+
+使用 REST 轮询获取最新 1 分钟 K 线与买卖盘最优价量，追加保存到 `data/raw/`。数据源接口支持后续替换为 WebSocket。
+
+单次采集（验证连通性）：
+
+```powershell
+conda activate arima-env
+python -m src.data.collect_live --once
+```
+
+持续采集（默认每 10 秒轮询，Ctrl+C 优雅退出）：
+
+```powershell
+conda activate arima-env
+python -m src.data.collect_live
+```
+
+输出文件：
+
+- `data/raw/BTCUSDT_1m.csv`：K 线（与历史下载共用，按 timestamp 去重合并）
+- `data/raw/BTCUSDT_orderbook.csv`：盘口快照（含 spread、mid_price、book_imbalance）
+
+可选参数：
+
+- `--poll-interval 10`：轮询间隔秒数
+- `--kline-limit 2`：每次拉取最近 K 线根数
+- `--market spot|futures`：数据源
+- `--once`：只执行一轮后退出
+- `-v`：调试日志
+
+日志写入 `logs/data.log`（可用 `--no-log-file` 关闭文件日志）。
+
+运行测试：
+
+```powershell
+conda activate arima-env
+pytest tests/test_collect_live.py -v
+```
+
 ## 后续使用（待实现）
 
 以下命令将在各阶段实现后可用。所有命令均需在 `arima-env` 中执行。

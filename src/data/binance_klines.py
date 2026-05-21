@@ -74,7 +74,7 @@ class BinanceKlineClient:
         symbol: str,
         interval: str,
         *,
-        start_ms: int,
+        start_ms: Optional[int] = None,
         end_ms: Optional[int] = None,
         limit: int = MAX_KLINES_PER_REQUEST,
     ) -> List[List[Any]]:
@@ -82,9 +82,10 @@ class BinanceKlineClient:
         params: Dict[str, Any] = {
             "symbol": symbol.upper(),
             "interval": interval,
-            "startTime": start_ms,
             "limit": min(limit, MAX_KLINES_PER_REQUEST),
         }
+        if start_ms is not None:
+            params["startTime"] = start_ms
         if end_ms is not None:
             params["endTime"] = end_ms
 
@@ -128,6 +129,11 @@ class BinanceKlineClient:
         if last_error is not None:
             raise last_error
         raise RuntimeError("Failed to fetch K-lines after retries")
+
+    def fetch_latest(self, symbol: str, interval: str, *, limit: int = 2) -> pd.DataFrame:
+        """Fetch the most recent K-lines without a start time bound."""
+        page = self.fetch_page(symbol, interval, limit=min(limit, MAX_KLINES_PER_REQUEST))
+        return klines_to_dataframe(page)
 
     def _sleep_backoff(self, attempt: int) -> None:
         delay = self.retry_backoff * (2**attempt)

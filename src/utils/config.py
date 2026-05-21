@@ -100,6 +100,12 @@ class Settings:
     telegram_chat_id: Optional[str]
     dry_run: bool
     log_level: str
+    live_poll_interval_seconds: float
+    live_kline_limit: int
+    live_max_retries: int
+    live_retry_backoff: float
+    live_max_consecutive_errors: int
+    live_error_retry_delay_seconds: float
     data_dir: Path
     logs_dir: Path
     project_root: Path
@@ -134,6 +140,22 @@ class Settings:
             telegram_chat_id=_optional_str(os.getenv("TELEGRAM_CHAT_ID")),
             dry_run=_parse_bool(os.getenv("DRY_RUN"), True),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            live_poll_interval_seconds=_parse_float(
+                "LIVE_POLL_INTERVAL_SECONDS", os.getenv("LIVE_POLL_INTERVAL_SECONDS"), 10.0
+            ),
+            live_kline_limit=_parse_int("LIVE_KLINE_LIMIT", os.getenv("LIVE_KLINE_LIMIT"), 2),
+            live_max_retries=_parse_int("LIVE_MAX_RETRIES", os.getenv("LIVE_MAX_RETRIES"), 5),
+            live_retry_backoff=_parse_float(
+                "LIVE_RETRY_BACKOFF", os.getenv("LIVE_RETRY_BACKOFF"), 1.0
+            ),
+            live_max_consecutive_errors=_parse_int(
+                "LIVE_MAX_CONSECUTIVE_ERRORS", os.getenv("LIVE_MAX_CONSECUTIVE_ERRORS"), 10
+            ),
+            live_error_retry_delay_seconds=_parse_float(
+                "LIVE_ERROR_RETRY_DELAY_SECONDS",
+                os.getenv("LIVE_ERROR_RETRY_DELAY_SECONDS"),
+                5.0,
+            ),
             data_dir=data_dir,
             logs_dir=logs_dir,
             project_root=project_root,
@@ -198,6 +220,38 @@ class Settings:
         if self.log_level not in ALLOWED_LOG_LEVELS:
             errors.append(
                 f"LOG_LEVEL must be one of {sorted(ALLOWED_LOG_LEVELS)}, got: {self.log_level!r}"
+            )
+
+        if self.live_poll_interval_seconds < 1.0:
+            errors.append(
+                "LIVE_POLL_INTERVAL_SECONDS must be at least 1.0, "
+                f"got: {self.live_poll_interval_seconds}"
+            )
+
+        if self.live_kline_limit < 1 or self.live_kline_limit > 1000:
+            errors.append(
+                "LIVE_KLINE_LIMIT must be between 1 and 1000, "
+                f"got: {self.live_kline_limit}"
+            )
+
+        if self.live_max_retries < 1:
+            errors.append(f"LIVE_MAX_RETRIES must be at least 1, got: {self.live_max_retries}")
+
+        if self.live_retry_backoff <= 0:
+            errors.append(
+                f"LIVE_RETRY_BACKOFF must be positive, got: {self.live_retry_backoff}"
+            )
+
+        if self.live_max_consecutive_errors < 1:
+            errors.append(
+                "LIVE_MAX_CONSECUTIVE_ERRORS must be at least 1, "
+                f"got: {self.live_max_consecutive_errors}"
+            )
+
+        if self.live_error_retry_delay_seconds <= 0:
+            errors.append(
+                "LIVE_ERROR_RETRY_DELAY_SECONDS must be positive, "
+                f"got: {self.live_error_retry_delay_seconds}"
             )
 
         if self.telegram_bot_token and not TELEGRAM_TOKEN_PATTERN.match(self.telegram_bot_token):
