@@ -78,6 +78,8 @@ event/
     signals/      # 信号引擎
     notify/       # Telegram 推送
     backtest/     # 回测
+    live_runner.py # 实时运行循环
+    app.py        # 实时运行入口
     utils/        # 工具与配置
   tests/          # 单元测试
   .env.example    # 配置示例
@@ -157,36 +159,89 @@ conda activate arima-env
 pytest tests/test_collect_live.py -v
 ```
 
-## 后续使用（待实现）
-
-以下命令将在各阶段实现后可用。所有命令均需在 `arima-env` 中执行。
-
-### 运行回测
+## 运行回测
 
 ```powershell
 conda activate arima-env
 python -m src.backtest.run_backtest --symbol BTCUSDT --data data/raw/BTCUSDT_1m.csv --prediction-minutes 10
 ```
 
-### 测试 Telegram
+回测结果写入 `data/backtest/`。建议先在不少于 30 天的 1 分钟数据上验证胜率后再开启实时推送。
+
+运行测试：
+
+```powershell
+conda activate arima-env
+pytest tests/test_backtest.py -v
+```
+
+## 测试 Telegram
 
 ```powershell
 conda activate arima-env
 python -m src.notify.telegram --test
 ```
 
-### 实时运行（dry-run）
+Dry-run 测试（只写日志，不调用 Telegram API）：
+
+```powershell
+conda activate arima-env
+python -m src.notify.telegram --test --dry-run
+```
+
+## 实时运行
+
+实时入口整合数据采集、ARIMA 预测、信号引擎与 Telegram 推送。支持日志、异常重试、优雅退出（Ctrl+C）和 dry-run 模式。
+
+**建议先用 dry-run 验证数据、模型和日志：**
 
 ```powershell
 conda activate arima-env
 python -m src.app --mode live --dry-run
 ```
 
-### 实时运行（推送信号）
+单轮测试（不进入持续循环）：
+
+```powershell
+conda activate arima-env
+python -m src.app --mode live --dry-run --once
+```
+
+确认无误后，开启真实 Telegram 推送：
+
+```powershell
+conda activate arima-env
+python -m src.app --mode live --no-dry-run
+```
+
+或在 `.env` 中设置 `DRY_RUN=false` 后直接运行：
 
 ```powershell
 conda activate arima-env
 python -m src.app --mode live
+```
+
+可选参数：
+
+- `--poll-interval 10`：每轮循环间隔秒数（默认读取 `LIVE_POLL_INTERVAL_SECONDS`）
+- `--symbol BTCUSDT` / `--interval 1m` / `--market spot|futures`：覆盖 `.env` 配置
+- `--once`：只执行一轮后退出
+- `--no-health-check`：跳过启动时的 Telegram 健康检查
+- `-v`：调试日志
+
+运行日志：
+
+- `logs/app.log`：主程序
+- `logs/data.log`：数据采集
+- `logs/model.log`：ARIMA 预测
+- `logs/signal.log`：信号过滤
+- `logs/telegram.log`：Telegram 推送
+
+运行测试：
+
+```powershell
+conda activate arima-env
+pytest tests/test_live_runner.py -v
 ```
 
 ## 风险提示

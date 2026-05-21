@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -34,6 +35,28 @@ class MarketDataStorage:
 
     def order_book_path(self, symbol: str) -> Path:
         return self.raw_dir / order_book_filename(symbol)
+
+    def load_klines(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        tail: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Load stored K-lines, optionally keeping only the most recent ``tail`` rows."""
+        path = self.kline_path(symbol, interval)
+        if not path.exists():
+            return pd.DataFrame(columns=list(KLINE_COLUMNS))
+
+        frame = pd.read_csv(path)
+        missing = [column for column in KLINE_COLUMNS if column not in frame.columns]
+        if missing:
+            raise ValueError(f"K-line file {path} is missing required columns: {missing}")
+
+        frame = frame.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+        if tail is not None and tail > 0:
+            frame = frame.tail(tail)
+        return frame.reset_index(drop=True)
 
     def append_klines(self, symbol: str, interval: str, frame: pd.DataFrame) -> int:
         """

@@ -10,6 +10,7 @@ from typing import Optional
 
 from src.data.market_data_source import MarketDataSource
 from src.data.market_data_storage import MarketDataStorage
+from src.data.order_book_schema import OrderBookSnapshot
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class PollResult:
     order_book_saved: bool
     latest_kline_timestamp: Optional[int]
     order_book_timestamp: Optional[int]
+    order_book: Optional[OrderBookSnapshot] = None
 
 
 class LiveMarketCollector:
@@ -79,6 +81,7 @@ class LiveMarketCollector:
             order_book_saved=True,
             latest_kline_timestamp=latest_ts,
             order_book_timestamp=snapshot.timestamp,
+            order_book=snapshot,
         )
 
     def run(self, *, max_iterations: Optional[int] = None) -> None:
