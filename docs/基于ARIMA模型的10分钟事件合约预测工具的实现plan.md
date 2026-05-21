@@ -2,683 +2,595 @@
 
 ## 1. 项目目标
 
-本工具用于辅助 Binance 10 分钟事件合约的人工决策。首版只做预测与 Telegram 信号提醒，不自动下单、不托管资金、不调用事件合约交易接口。
+本项目目标是实现一个面向 Binance 10 分钟事件合约的预测提醒工具。工具不直接自动下单，只根据公开市场数据生成“涨 / 跌 / 观望”信号，并在信号满足置信度阈值时推送到 Telegram。
 
-核心工作流：
+核心工作流如下：
 
-```text
-抓取 Binance 1 分钟 K 线
-  -> 清洗并生成价格/收益率序列
-  -> 使用 ARIMA 模型滚动预测未来 10 分钟方向
-  -> 当预测方向为涨/跌且置信度超过阈值时生成开仓信号
-  -> 将信号推送到 Telegram
+```mermaid
+flowchart LR
+    marketData["Binance 1分钟K线、成交量、买卖盘"] --> dataLayer["数据清洗与特征整理"]
+    dataLayer --> arimaModel["ARIMA训练与滚动预测"]
+    arimaModel --> signalEngine["方向判断与置信度过滤"]
+    signalEngine --> telegram["Telegram信号推送"]
+    signalEngine --> logs["日志与回测记录"]
 ```
 
-首版目标是先做一个可验证、可回测、可长期运行的信号工具，而不是追求复杂模型。ARIMA 的优势是实现简单、推理快、可解释，适合作为 10 分钟预测工具的统计基线。
+10 分钟事件合约的预测目标是判断当前开仓后，约 10 分钟到期时的价格相对开仓价格是上涨还是下跌。由于事件合约自身 API 可用性不确定，第一版工具应优先使用 Binance 公开市场数据作为预测输入，例如现货或 U 本位合约的 `BTCUSDT` 1 分钟 K 线、成交量、成交方向和盘口数据。
 
-## 2. 范围与假设
+## 2. 运行环境约束
 
-### 2.1 首版包含
+项目 Python 环境固定为 Anaconda 创建的 `arima-env`。后续所有终端命令都必须先激活该环境，再执行安装、训练、回测或实时运行命令。
 
-- 使用 Python 实现命令行工具和常驻信号服务。
-- 从 Binance 公共 Kline API 拉取 1 分钟 K 线。
-- 支持历史数据回填、本地存储和增量更新。
-- 使用 `statsmodels` 的 ARIMA/SARIMAX 进行滚动窗口预测。
-- 输出未来 10 根 1 分钟 K 线的累计方向预测。
-- 根据信号置信度、最小预测幅度、冷却时间等规则决定是否提醒。
-- 通过 Telegram Bot API 向指定 chat 推送信号。
-- 提供基础回测，用于校准 ARIMA 参数、置信度阈值和信号频率。
+Windows PowerShell 中的环境激活方式：
 
-### 2.2 首版不包含
+```powershell
+conda activate arima-env
+```
 
-- 自动下单或任何资金操作。
-- 事件合约私有 API 集成。
-- 盘口、逐笔成交、新闻情绪、链上指标等高阶特征。
-- LSTM、XGBoost、Transformer、强化学习等非 ARIMA 模型。
-- 多用户权限系统、Web 后台和复杂可视化界面。
+如果 PowerShell 无法识别 `conda activate`，先执行 Anaconda 初始化并重新打开终端：
 
-### 2.3 默认实现假设
+```powershell
+conda init powershell
+```
 
-- 默认交易对：`BTCUSDT`，但必须支持通过配置切换。
-- 默认周期：`1m` K 线。
-- 默认预测期限：`10` 分钟。
-- 默认训练窗口：最近 `1000-3000` 根 1 分钟 K 线，具体通过回测校准。
-- 默认信号阈值：置信度从 `0.60-0.65` 起步，最小预测幅度从 `0.03%-0.08%` 起步，实际值必须由回测结果决定。
-- Telegram Token、Chat ID、交易对、阈值等敏感或可变参数都放在 `.env` 或配置文件中，不写死在代码里。
+计划使用的主要 Python 依赖包括：
 
-## 3. 推荐技术栈
-
-- Python 3.11 或更高版本。
-- `pandas`：K 线数据处理和时间序列整理。
+- `pandas`：处理 K 线、成交量、盘口快照和回测结果。
 - `numpy`：数值计算。
-- `statsmodels`：ARIMA/SARIMAX 建模。
-- `requests` 或 `httpx`：调用 Binance 和 Telegram HTTP API。
-- `python-dotenv` 或 `pydantic-settings`：加载环境变量。
-- `typer` 或 `argparse`：命令行入口。
-- `pytest`：测试。
-- `ruff`：代码格式和静态检查。
-- `pyarrow`：可选，用于 Parquet 存储。
+- `statsmodels` 或 `pmdarima`：ARIMA 建模、参数选择和预测。
+- `python-binance` 或 `ccxt`：获取 Binance 行情数据。
+- `websocket-client`：订阅实时行情或盘口数据。
+- `python-dotenv`：读取 `.env` 中的 Telegram 和 Binance 配置。
+- `requests`：调用 Telegram Bot API。
+- `loguru` 或标准库 `logging`：记录运行日志。
+- `pytest`：后续实现单元测试和关键流程测试。
 
-建议本地数据优先使用 `data/klines/{symbol}_1m.parquet`。如果项目希望更轻量，也可以先用 CSV，但 Parquet 在增量读写、体积和类型保持上更适合后续扩展。
+敏感信息必须放在 `.env` 中，不应提交到 git 仓库。
 
-## 4. 目录结构建议
+## 3. 功能边界
 
-```text
-.
-├── .env.example
-├── README.md
-├── requirements.txt 或 pyproject.toml
-├── data/
-│   ├── klines/
-│   ├── predictions/
-│   └── backtests/
-├── src/
-│   └── event_predictor/
-│       ├── __init__.py
-│       ├── cli.py
-│       ├── config.py
-│       ├── binance_client.py
-│       ├── storage.py
-│       ├── features.py
-│       ├── arima_model.py
-│       ├── signal.py
-│       ├── telegram.py
-│       ├── backtest.py
-│       └── scheduler.py
-└── tests/
-    ├── test_features.py
-    ├── test_signal.py
-    └── test_backtest.py
-```
+第一版工具应该聚焦于“预测与提醒”，不实现自动交易。推荐功能边界如下：
 
-## 5. 数据流程设计
+- 支持配置交易标的，默认 `BTCUSDT`。
+- 支持抓取 Binance 1 分钟 K 线数据，包括开盘价、最高价、最低价、收盘价和成交量。
+- 支持获取买卖盘数据，至少包含最优买价、最优卖价、买一量、卖一量和盘口价差。
+- 支持将历史数据保存到本地文件或轻量数据库，便于回测和模型重训。
+- 使用 ARIMA 或 Auto ARIMA 对价格收益率或差分价格序列做滚动预测。
+- 将 10 分钟预测结果转换为“涨 / 跌 / 观望”信号。
+- 当预测方向明确且置信度达到阈值时，推送 Telegram 消息。
+- 支持回测模式和实时模式。
+- 支持日志、错误重试和运行状态监控。
 
-### 5.1 Binance 1 分钟 K 线抓取
+不做事项：
 
-数据源使用 Binance 公共 REST Kline 接口：
+- 不自动点击或调用事件合约下单。
+- 不保证盈利。
+- 不绕过 Binance 地区限制、账户限制或合规限制。
+- 不把 API Key、Bot Token、Chat ID 写入代码。
 
-- Spot Kline：`GET /api/v3/klines`
-- Futures Kline：`GET /fapi/v1/klines`
+## 4. 数据设计
 
-首版建议优先使用与事件合约标的最接近、可稳定访问的数据源。若事件合约参考的是某个指数或合约价格，应在 README 中明确说明当前使用的替代价格源。
+### 4.1 数据来源
 
-每根 K 线至少保留：
+数据优先级如下：
 
-- `open_time`
+1. Binance 官方公开 REST API：用于补齐历史 1 分钟 K 线。
+2. Binance WebSocket：用于实时订阅 K 线、成交和盘口。
+3. Data.Binance.Vision：用于下载更长历史数据，适合作为后续增强。
+4. 第三方 Tick 或盘口数据源：作为后续优化，不纳入第一版必要范围。
+
+### 4.2 必需数据字段
+
+1 分钟 K 线字段：
+
+- `timestamp`
 - `open`
 - `high`
 - `low`
 - `close`
 - `volume`
-- `close_time`
 - `quote_volume`
 - `trade_count`
+- `taker_buy_base_volume`
+- `taker_buy_quote_volume`
 
-实时服务必须只使用已经闭合的 1 分钟 K 线，避免把未完成 K 线当成确定价格，从而造成未来函数或信号漂移。
+盘口字段：
 
-### 5.2 本地存储
+- `timestamp`
+- `best_bid_price`
+- `best_bid_qty`
+- `best_ask_price`
+- `best_ask_qty`
+- `spread`
+- `mid_price`
+- `book_imbalance`
 
-本地存储要求：
+其中 `book_imbalance` 可定义为买一量和卖一量的相对差值，用于辅助判断盘口偏向。
 
-- 按 `symbol + interval` 分文件保存。
-- 使用 `open_time` 去重。
-- 每次增量拉取后按时间排序。
-- 对缺失分钟做检测，发现缺口时记录日志并尝试补齐。
-- 所有时间统一使用 UTC。
+### 4.3 数据存储
 
-### 5.3 数据清洗
+第一版建议使用本地 `data/` 目录保存数据：
 
-清洗规则：
+- `data/raw/`：原始 K 线、盘口和成交数据。
+- `data/processed/`：清洗后的训练数据。
+- `data/backtest/`：回测结果。
+- `logs/`：运行日志。
 
-- 将价格字段转成浮点数或 `Decimal` 后再计算。
-- 丢弃重复 K 线。
-- 检查时间间隔是否严格为 1 分钟。
-- 对缺失 K 线不做随意插值；优先重新拉取，无法补齐时在建模窗口中跳过该区间。
-- 计算 log price 和 log return：
+数据文件建议使用 CSV 或 Parquet。若后续数据量增大，可以迁移到 SQLite、DuckDB 或 TimescaleDB。
 
-```text
-log_price_t = log(close_t)
-log_return_t = log(close_t / close_{t-1})
-```
+## 5. ARIMA 建模方案
 
-ARIMA 可直接建模价格差分，也可建模 log return。首版建议以 log return 为主，因为短期价格通常非平稳，而收益率序列更接近平稳。
+### 5.1 建模对象
 
-## 6. ARIMA 建模方案
+ARIMA 更适合处理平稳时间序列，因此不建议直接对原始价格建模。第一版建议优先对以下序列建模：
 
-### 6.1 预测目标
+- 1 分钟收盘价的对数收益率。
+- 或经过一阶差分后的收盘价序列。
 
-在每个信号评估时刻 `t`：
+预测目标是未来 10 分钟的累计变化方向：
 
-- 输入：截至 `t` 已闭合的 1 分钟 K 线。
-- 预测：未来 10 分钟累计收益 `R_{t,t+10}`。
-- 输出：
-  - `direction = UP`：预测累计收益大于 0。
-  - `direction = DOWN`：预测累计收益小于 0。
-  - `confidence`：方向判断的估计置信度。
-  - `expected_return`：预测累计收益。
-  - `target_price`：预测到期参考价格。
+- 若未来 10 分钟预测累计收益率大于正阈值，输出“涨”。
+- 若未来 10 分钟预测累计收益率小于负阈值，输出“跌”。
+- 若预测变化幅度不足或模型不确定性较高，输出“观望”。
 
-### 6.2 模型输入
+### 5.2 训练方式
 
-首版推荐输入序列：
+推荐使用滚动窗口训练：
 
-```text
-y_t = log_return_t
-```
+- 每次使用最近 `N` 根 1 分钟 K 线训练或更新模型。
+- `N` 初始可取 720 到 2880，即最近 12 小时到 2 天数据。
+- 每分钟获得新 K 线后更新输入序列，并重新预测未来 10 分钟。
+- 第一版可以每 5 到 10 分钟重新拟合一次模型，避免每分钟完整重训造成延迟。
 
-使用最近 `N` 根 1 分钟收益率作为滚动训练窗口。`N` 可从 `1000`、`2000`、`3000` 三档开始回测比较。
+ARIMA 阶数选择：
 
-### 6.3 ARIMA 参数
+- 第一版可用固定参数作为基线，例如 `(p,d,q)` 在小范围内网格搜索。
+- 后续可引入 `auto_arima` 自动选择参数。
+- 每次选择参数时必须基于训练窗口内部数据，不允许使用未来数据。
 
-先从小范围网格搜索开始：
+### 5.3 置信度定义
 
-- `p`: `0-5`
-- `d`: 对 log return 通常为 `0`；如果建模 log price，则通常为 `1`
-- `q`: `0-5`
+ARIMA 本身输出的是预测值和预测区间，不直接输出分类概率。第一版可以使用综合置信度：
 
-参数选择方式：
+- 预测方向强度：未来 10 分钟累计预测收益率的绝对值。
+- 噪声调整：预测收益率除以训练窗口残差标准差。
+- 预测区间一致性：预测区间上下界是否都偏向同一方向。
+- 市场过滤：成交量是否足够、盘口价差是否过大、盘口不平衡是否支持预测方向。
+- 回测校准：最近滚动回测中同类信号的历史胜率。
 
-- 初始可按 AIC/BIC 自动选取。
-- 实盘服务中不建议每分钟全量网格搜索，避免耗时和不稳定。
-- 推荐每日或每数小时重新选择一次参数，实时预测使用最近选出的 `(p, d, q)`。
-- 如果模型拟合失败，记录错误并跳过本轮信号，不发送低质量提醒。
+示例决策规则：
 
-### 6.4 10 分钟预测
+- `score >= confidence_threshold` 且预测累计收益率为正：推送“涨”信号。
+- `score >= confidence_threshold` 且预测累计收益率为负：推送“跌”信号。
+- 其他情况：记录为“观望”，不推送开仓信号。
 
-对未来 10 步收益率做预测：
+阈值应通过回测确定，不应主观固定。第一版可以从较保守的阈值开始，优先减少低质量信号。
 
-```text
-predicted_returns = forecast(steps=10)
-expected_return = sum(predicted_returns)
-target_price = current_close * exp(expected_return)
-```
+## 6. 信号生成逻辑
 
-方向判断：
+信号对象建议包含以下信息：
 
-```text
-if expected_return > 0: UP
-if expected_return < 0: DOWN
-```
+- 交易标的，例如 `BTCUSDT`。
+- 当前时间。
+- 当前价格或中间价。
+- 预测到期时间，例如当前时间后 10 分钟。
+- 预测方向：`UP`、`DOWN` 或 `HOLD`。
+- 预测累计收益率。
+- 置信度分数。
+- ARIMA 参数。
+- 盘口价差。
+- 成交量过滤结果。
+- 风险提示。
 
-如果 `expected_return` 的绝对值过小，即使置信度达标也应过滤，因为事件合约方向预测需要覆盖噪声、延迟和价差影响。
+Telegram 推送消息应简洁，但必须包含足够的交易判断信息：
 
-### 6.5 置信度估算
+- 标的。
+- 信号方向。
+- 当前价格。
+- 预测到期时间。
+- 置信度。
+- 触发原因摘要。
+- 提醒“不自动下单，需人工确认”。
 
-ARIMA 本身输出的是预测均值和置信区间，不是直接的二分类概率。首版可用以下方式估算方向置信度：
+为避免刷屏，需要加入冷却机制：
 
-1. 获取未来 10 步累计预测收益的均值 `mu` 和标准差 `sigma`。
-2. 假设预测误差近似正态分布。
-3. 对上涨方向：
+- 同一标的同一方向信号在指定分钟内只推送一次。
+- 若连续信号方向反转，应额外标注“方向反转”。
+- 若数据源异常或模型失败，应推送错误告警或写入日志，避免静默失效。
 
-```text
-confidence_up = P(R > 0) = 1 - CDF(0, mu, sigma)
-```
+## 7. 回测与验收标准
 
-4. 对下跌方向：
+实现实时推送前，必须先完成历史回测。回测需要模拟以下流程：
 
-```text
-confidence_down = P(R < 0) = CDF(0, mu, sigma)
-```
+1. 按时间顺序读取历史 1 分钟数据。
+2. 在每个可预测时间点，只使用过去数据训练和预测。
+3. 生成未来 10 分钟方向信号。
+4. 将预测方向与真实 10 分钟后价格方向比较。
+5. 统计信号质量和策略表现。
 
-最终：
+核心指标：
 
-```text
-confidence = max(confidence_up, confidence_down)
-```
+- 总样本数。
+- 信号数。
+- 信号频率。
+- 涨信号胜率。
+- 跌信号胜率。
+- 总胜率。
+- 准确率。
+- 平衡准确率。
+- 最大连错次数。
+- 按天统计的信号数量和胜率。
+- 简化收益模拟。
 
-如果无法可靠取得预测方差，可以用滚动回测残差估计 `sigma`。此时必须在文档和日志中标注该置信度是经验估计，不是保证胜率。
+第一版建议验收门槛：
 
-## 7. 信号生成规则
+- 回测逻辑无未来函数。
+- 在不少于 30 天的 1 分钟数据上完成滚动回测。
+- 信号胜率显著高于随机基准后，才开启实时 Telegram 推送。
+- 若胜率不稳定，应降低推送频率或继续调参，不应进入实盘提醒。
 
-每分钟评估一次，但不一定每分钟发信号。建议规则：
+## 8. 项目目录建议
 
-- 只在新闭合 1 分钟 K 线后运行预测。
-- `confidence >= MIN_CONFIDENCE` 才允许发信号。
-- `abs(expected_return) >= MIN_EXPECTED_RETURN` 才允许发信号。
-- 同一交易对发出信号后进入冷却期，例如 `10-20` 分钟。
-- 如果最近连续失败次数过多，可进入暂停期。
-- 如果数据缺口、模型拟合失败、Telegram 发送失败，不生成开仓信号，只记录日志。
-
-信号对象建议包含：
-
-```text
-symbol
-interval
-horizon_minutes
-direction
-confidence
-expected_return
-current_price
-target_price
-model_order
-train_window
-generated_at
-expires_at
-reason
-```
-
-## 8. Telegram 推送设计
-
-Telegram 消息应简洁但包含人工决策所需信息。
-
-推荐格式：
+后续实现代码时，建议使用以下目录结构：
 
 ```text
-Binance 10分钟事件合约信号
-
-交易对: BTCUSDT
-方向: UP / 看涨
-置信度: 64.2%
-当前参考价: 68250.10
-预测10分钟后: 68308.45
-预测收益: +0.085%
-模型: ARIMA(2,0,2)
-训练窗口: 2000根1m K线
-信号时间: 2026-05-22 02:30:00 UTC
-有效期: 约10分钟
-
-提示: 该信号仅供人工参考，不自动下单。事件合约可能损失全部投入本金。
+event/
+  config/
+    settings.example.env
+  data/
+    raw/
+    processed/
+    backtest/
+  docs/
+    基于ARIMA模型的10分钟事件合约预测工具的实现plan.md
+  logs/
+  src/
+    data/
+    features/
+    models/
+    signals/
+    notify/
+    backtest/
+    utils/
+  tests/
+  README.md
+  requirements.txt
 ```
 
-Telegram 配置：
+这只是实现建议，不要求在本文档创建阶段生成代码。
 
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-- `TELEGRAM_TIMEOUT_SECONDS`
+## 9. 实施阶段
 
-安全要求：
+### 阶段 1：项目骨架与配置
 
-- `.env` 不提交到 git。
-- 提供 `.env.example` 作为模板。
-- 日志中不得打印完整 Bot Token。
+目标：
 
-## 9. 回测与评估
+- 创建 Python 项目结构。
+- 添加 `.env.example`。
+- 明确所有命令都在 `arima-env` 中执行。
+- 建立统一配置读取方式。
 
-回测必须在实盘提醒前完成。回测的目的不是证明策略一定盈利，而是校准阈值、发现过拟合和估计信号频率。
+验收：
 
-### 9.1 标签定义
+- 能读取交易标的、时间周期、Telegram 配置和阈值配置。
+- 敏感配置不会进入 git。
 
-对每个历史时刻 `t`：
+### 阶段 2：历史数据采集
+
+目标：
+
+- 从 Binance 获取 1 分钟 K 线。
+- 支持指定标的、开始时间、结束时间。
+- 保存到本地 `data/raw/`。
+
+验收：
+
+- 能下载至少 30 天 `BTCUSDT` 1 分钟数据。
+- 数据字段完整、时间连续、无明显重复。
+
+### 阶段 3：实时数据采集
+
+目标：
+
+- 使用 REST 轮询或 WebSocket 获取最新 1 分钟 K 线。
+- 获取买卖盘最优价、最优量和价差。
+- 将实时数据追加到本地。
+
+验收：
+
+- 能持续运行并记录最新数据。
+- 断线后有重试机制。
+
+### 阶段 4：特征与标签
+
+目标：
+
+- 构造收益率、差分价格、滚动波动率、成交量变化和盘口不平衡。
+- 构造未来 10 分钟方向标签，用于回测评估。
+
+验收：
+
+- 所有特征只使用当前及过去数据。
+- 标签只用于回测，不进入实时预测输入。
+
+### 阶段 5：ARIMA 模型
+
+目标：
+
+- 训练 ARIMA 模型。
+- 支持固定阶数和可选自动选参。
+- 输出未来 10 分钟累计预测方向、预测幅度和置信度基础信息。
+
+验收：
+
+- 能在历史数据上滚动预测。
+- 模型失败时能记录原因并跳过该轮，不导致主程序崩溃。
+
+### 阶段 6：信号引擎
+
+目标：
+
+- 将 ARIMA 预测结果转换为 `UP`、`DOWN`、`HOLD`。
+- 加入成交量、盘口价差和冷却时间过滤。
+- 生成结构化信号记录。
+
+验收：
+
+- 低置信度预测不会推送。
+- 信号频率可通过配置控制。
+
+### 阶段 7：Telegram 推送
+
+目标：
+
+- 接入 Telegram Bot API。
+- 支持发送信号消息和异常告警。
+- 支持启动时发送健康检查消息。
+
+验收：
+
+- 使用测试 Bot 能收到消息。
+- Token 或 Chat ID 缺失时给出清晰错误。
+
+### 阶段 8：回测与调参
+
+目标：
+
+- 实现无未来函数的滚动回测。
+- 输出指标报表。
+- 根据回测结果调整置信度阈值和过滤规则。
+
+验收：
+
+- 生成可读的回测结果文件。
+- 能对比不同 ARIMA 参数、不同窗口长度和不同阈值。
+
+### 阶段 9：实时运行与文档
+
+目标：
+
+- 提供实时运行入口。
+- 完成 README 使用说明。
+- 明确风险提示和人工确认流程。
+
+验收：
+
+- 在 `arima-env` 中可按文档步骤运行。
+- Telegram 能收到实时信号或健康检查消息。
+
+## 10. 给 Cursor 顺序执行的 Prompts
+
+以下 prompts 可在后续实现阶段逐条交给 Cursor 执行。建议每执行完一条，都先运行测试或最小验证，再进入下一条。
+
+### Prompt 1：创建项目骨架
 
 ```text
-future_return_10m = log(close_{t+10} / close_t)
-label = UP if future_return_10m > 0 else DOWN
+请基于 docs/基于ARIMA模型的10分钟事件合约预测工具的实现plan.md 创建 Python 项目骨架。不要实现完整业务逻辑，只创建目录、README 初稿、requirements.txt、.env.example 和基础配置模块。项目环境是 Anaconda 的 arima-env，README 中所有命令都必须先提示 conda activate arima-env。不要提交 git commit。
 ```
 
-如果 future return 非常接近 0，可以单独统计为 `FLAT` 或从训练评估中剔除，但事件合约最终仍只有涨/跌结果，因此该规则要在文档中固定。
-
-### 9.2 回测方式
-
-- 使用滚动窗口训练，严格只使用 `t` 之前的数据。
-- 每次预测未来 10 分钟。
-- 应用与实盘完全一致的信号门控规则。
-- 统计所有信号，而不是统计每一分钟的裸预测。
-
-### 9.3 关键指标
-
-- 预测准确率。
-- 上涨/下跌分别的准确率。
-- 信号次数和日均信号次数。
-- 平均置信度。
-- 不同置信度分桶下的胜率。
-- 最大连续失败次数。
-- 简化收益曲线。
-- 与随机 50% 基准的差异。
-
-建议验收门槛：
-
-- 回测流程无未来数据泄露。
-- 高置信度分桶胜率应明显高于 50%，否则不建议上线提醒。
-- 信号频率不能过高；如果一天几十上百条，说明阈值过低或冷却期不足。
-- 在不同月份、不同市场波动环境下表现不能严重失衡。
-
-## 10. 实时运行设计
-
-实时服务循环：
+### Prompt 2：实现配置读取
 
 ```text
-1. 等待下一根 1 分钟 K 线闭合
-2. 拉取最近 K 线并更新本地数据
-3. 检查数据完整性
-4. 使用滚动窗口拟合或加载 ARIMA 参数
-5. 预测未来 10 分钟累计收益
-6. 计算方向、置信度和预测幅度
-7. 应用信号门控规则
-8. 若通过门控，推送 Telegram
-9. 写入预测和信号日志
-10. 进入下一轮
+请实现统一配置读取模块，支持从 .env 读取 Binance 数据源配置、交易标的、K线周期、预测窗口、ARIMA 参数、置信度阈值、Telegram Bot Token 和 Chat ID。敏感信息不能写死。请补充配置校验和对应测试。
 ```
 
-运行要求：
-
-- 每轮任务应在数秒内完成。
-- Binance 请求失败要重试，但不能无限阻塞。
-- 模型拟合失败要跳过本轮。
-- Telegram 失败要记录错误，并可在下一轮继续运行。
-- 服务重启后应能从本地数据继续增量更新。
-
-## 11. 配置项设计
-
-建议 `.env.example` 包含：
+### Prompt 3：实现历史 K 线下载
 
 ```text
-BINANCE_MARKET=spot
-BINANCE_SYMBOL=BTCUSDT
-BINANCE_INTERVAL=1m
-PREDICTION_HORIZON_MINUTES=10
-TRAIN_WINDOW=2000
-ARIMA_ORDER=2,0,2
-AUTO_SELECT_ARIMA_ORDER=false
-MIN_CONFIDENCE=0.63
-MIN_EXPECTED_RETURN=0.0005
-SIGNAL_COOLDOWN_MINUTES=10
-DATA_DIR=data
-TELEGRAM_BOT_TOKEN=replace_me
-TELEGRAM_CHAT_ID=replace_me
-LOG_LEVEL=INFO
+请实现 Binance 1 分钟 K 线历史数据下载功能，支持 symbol、start、end 参数，将数据保存到 data/raw/。需要处理分页、限频、重复数据和时间连续性检查。请提供在 arima-env 中运行的命令示例，并补充最小测试。
 ```
 
-配置加载要求：
-
-- 启动时校验必要配置。
-- 对数值配置做范围检查。
-- Token 缺失时允许跑回测，但不允许启动 Telegram 实时提醒。
-
-## 12. Cursor 分步实现 Prompts
-
-下面 prompts 可按顺序复制给 Cursor 执行。每一步完成后先运行相关测试或命令，再进入下一步。
-
-### Prompt 1：初始化 Python 项目骨架
+### Prompt 4：实现实时行情和盘口采集
 
 ```text
-请在当前仓库中初始化一个 Python 项目，用于 Binance 10 分钟事件合约 ARIMA 预测信号工具。
-
-要求：
-1. 使用 src layout，包名为 event_predictor。
-2. 添加 requirements.txt 或 pyproject.toml，依赖包含 pandas、numpy、statsmodels、requests 或 httpx、python-dotenv、typer、pytest、ruff。
-3. 创建 .env.example，包含 Binance、ARIMA、信号阈值、Telegram 相关配置。
-4. 创建 README.md，简要说明项目目标：只做 Telegram 信号提醒，不自动下单。
-5. 不实现业务逻辑，只建立目录、配置模板和最小 CLI 入口。
-6. 完成后运行基础导入检查或测试。
+请实现实时行情采集模块，获取 Binance 1 分钟 K 线和买卖盘最优价量。可以先使用 REST 轮询，接口设计要允许后续替换为 WebSocket。需要保存数据、记录日志、处理网络异常和重试。
 ```
 
-### Prompt 2：实现配置加载
+### Prompt 5：实现特征与标签生成
 
 ```text
-请实现 event_predictor.config 模块。
-
-要求：
-1. 从 .env 和环境变量读取配置。
-2. 支持 BINANCE_MARKET、BINANCE_SYMBOL、BINANCE_INTERVAL、PREDICTION_HORIZON_MINUTES、TRAIN_WINDOW、ARIMA_ORDER、MIN_CONFIDENCE、MIN_EXPECTED_RETURN、SIGNAL_COOLDOWN_MINUTES、DATA_DIR、TELEGRAM_BOT_TOKEN、TELEGRAM_CHAT_ID。
-3. 对数值范围做校验，例如置信度必须在 0.5 到 1.0 之间，预测周期必须为正整数。
-4. ARIMA_ORDER 从 "p,d,q" 字符串解析成三元组。
-5. 添加单元测试覆盖默认值、非法值和 ARIMA_ORDER 解析。
+请实现特征工程模块：基于 1 分钟 K 线生成 log return、差分价格、滚动波动率、成交量变化率、盘口价差、盘口不平衡等字段；同时为回测生成未来 10 分钟涨跌标签。请严格避免未来数据泄露，并写测试覆盖关键边界。
 ```
 
-### Prompt 3：实现 Binance K 线客户端
+### Prompt 6：实现 ARIMA 预测模块
 
 ```text
-请实现 event_predictor.binance_client 模块，用 Binance 公共 REST API 抓取 1 分钟 K 线。
-
-要求：
-1. 支持 spot 和 futures 两种 market 配置。
-2. 函数输入 symbol、interval、start_time、end_time、limit。
-3. 输出 pandas DataFrame，字段至少包含 open_time、open、high、low、close、volume、close_time、quote_volume、trade_count。
-4. 所有时间统一为 UTC datetime。
-5. 只返回已经闭合的 K 线。
-6. 对 HTTP 错误、限流、空响应做清晰异常处理。
-7. 添加测试，可 mock HTTP 响应，不依赖真实网络。
+请实现 ARIMA 预测模块，输入最近 N 根 1 分钟数据，使用收益率或差分价格序列训练模型，输出未来 10 分钟累计预测收益、方向、预测区间、残差波动和模型参数。支持固定 (p,d,q) 和可选 auto_arima。模型失败时返回可诊断错误，不要让主流程崩溃。
 ```
 
-### Prompt 4：实现本地存储与历史回填
+### Prompt 7：实现信号引擎
 
 ```text
-请实现 event_predictor.storage 和 CLI 的历史数据回填命令。
-
-要求：
-1. 将 K 线保存到 data/klines/{symbol}_{interval}.parquet。
-2. 读取已有数据后按 open_time 去重并排序。
-3. 支持 backfill 命令：给定 symbol、interval、开始时间、结束时间，分批拉取 Binance K 线并保存。
-4. 检测 1 分钟 K 线缺口，并在日志中输出缺口数量和范围。
-5. 添加单元测试覆盖去重、排序、缺口检测。
+请实现信号引擎，把 ARIMA 预测结果转换为 UP、DOWN、HOLD。信号需要结合预测幅度、残差波动、预测区间、成交量过滤、盘口价差过滤、盘口不平衡和冷却时间计算置信度。只有置信度达到阈值才生成 Telegram 推送信号。请补充测试。
 ```
 
-### Prompt 5：实现特征与 ARIMA 模型
+### Prompt 8：实现 Telegram 推送
 
 ```text
-请实现 event_predictor.features 和 event_predictor.arima_model。
-
-要求：
-1. features 中基于 close 计算 log_price 和 log_return。
-2. arima_model 使用 statsmodels ARIMA 或 SARIMAX。
-3. 输入最近 TRAIN_WINDOW 根 K 线，基于 log_return 拟合模型。
-4. 预测未来 10 步 log_return，输出 expected_return、target_price、prediction_std、model_order。
-5. 使用预测均值和标准差估算 UP/DOWN 方向置信度。
-6. 模型拟合失败时抛出可识别异常，不生成信号。
-7. 添加单元测试覆盖方向判断、收益率计算、异常路径。
+请实现 Telegram 通知模块，使用 Bot Token 和 Chat ID 推送信号消息、启动健康检查消息和异常告警。消息内容需要包含 symbol、方向、当前价格、预测到期时间、置信度、触发原因和人工确认提示。不要在代码中写死任何敏感信息。
 ```
 
-### Prompt 6：实现信号门控
+### Prompt 9：实现滚动回测
 
 ```text
-请实现 event_predictor.signal 模块。
-
-要求：
-1. 定义 Signal 数据结构，包含 symbol、direction、confidence、expected_return、current_price、target_price、model_order、generated_at、expires_at、reason。
-2. 实现信号门控规则：MIN_CONFIDENCE、MIN_EXPECTED_RETURN、SIGNAL_COOLDOWN_MINUTES。
-3. 当置信度不足、预测幅度不足、冷却期未结束时，不生成开仓信号，并返回明确原因。
-4. 添加单元测试覆盖通过、置信度不足、幅度不足、冷却期过滤。
+请实现滚动回测模块，按时间顺序模拟每一分钟的预测，只允许使用过去数据训练 ARIMA，并用未来 10 分钟真实方向评估结果。输出信号数、信号频率、胜率、平衡准确率、最大连错、按日胜率和简化收益模拟。请确保没有未来函数。
 ```
 
-### Prompt 7：实现 Telegram 推送
+### Prompt 10：实现实时运行入口
 
 ```text
-请实现 event_predictor.telegram 模块。
-
-要求：
-1. 使用 Telegram Bot API sendMessage 发送消息。
-2. 消息包含交易对、方向、置信度、当前参考价、预测10分钟后价格、预测收益、模型参数、训练窗口、信号时间、有效期和风险提示。
-3. Token 和 Chat ID 从配置读取。
-4. 日志中不得打印完整 Bot Token。
-5. 发送失败时抛出清晰异常，实时服务可捕获后继续运行。
-6. 添加测试，mock HTTP 请求并验证消息内容。
+请实现实时运行入口，持续获取最新 Binance 数据，更新 ARIMA 预测，调用信号引擎，并在满足阈值时推送 Telegram。需要有日志、异常重试、优雅退出和 dry-run 模式。README 中补充完整运行命令，所有命令都必须在 arima-env 中执行。
 ```
 
-### Prompt 8：实现回测命令
+### Prompt 11：完善测试、文档和风控说明
 
 ```text
-请实现 event_predictor.backtest 和 CLI 的 backtest 命令。
-
-要求：
-1. 从本地 K 线文件读取历史数据。
-2. 使用滚动窗口方式训练 ARIMA，严格只使用预测时刻之前的数据。
-3. 每次预测未来 10 分钟方向，并应用与实盘一致的信号门控规则。
-4. 输出准确率、信号次数、日均信号次数、UP/DOWN 分方向准确率、不同置信度分桶胜率、最大连续失败次数。
-5. 将结果保存到 data/backtests/。
-6. 添加测试，重点验证没有未来数据泄露。
+请补充测试、README 和风险说明。README 需要包含环境准备、.env 配置、历史数据下载、回测、实时运行、Telegram 测试、日志查看和常见问题。风险说明必须强调该工具只提供预测提醒，不构成投资建议，也不自动下单。
 ```
 
-### Prompt 9：实现实时信号服务
+## 11. 工具完成后的使用方法
 
-```text
-请实现 event_predictor.scheduler 和 CLI 的 run 命令。
+以下是工具完成后的预期使用流程，供后续 README 实现时参考。
 
-要求：
-1. 服务每分钟在 K 线闭合后运行一次。
-2. 增量拉取最新已闭合 K 线并更新本地存储。
-3. 检查数据完整性。
-4. 调用 ARIMA 模型生成预测。
-5. 调用 signal 模块判断是否需要提醒。
-6. 通过 Telegram 推送通过门控的信号。
-7. 将每次预测和信号结果保存到 data/predictions/。
-8. HTTP、模型、Telegram 任一环节失败时记录日志并进入下一轮，不让服务崩溃。
-```
+### 11.1 激活环境
 
-### Prompt 10：补齐文档、测试和运行检查
-
-```text
-请完善 README.md 和测试。
-
-要求：
-1. README 写清楚安装、配置 .env、历史回填、回测、启动实时服务、Telegram 验证方法。
-2. README 明确说明本工具只提供人工参考信号，不自动下单，事件合约可能损失全部投入本金。
-3. 添加或补齐关键单元测试。
-4. 运行 pytest 和 ruff，修复发现的问题。
-5. 确认 .env 不会被提交，并提供 .env.example。
-```
-
-## 13. 实现完成后的使用方法
-
-以下命令名称为建议形式，实际以最终 CLI 实现为准。
-
-### 13.1 准备环境
+每次打开终端后，先进入项目目录并激活环境：
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+cd C:\dev\program\event
+conda activate arima-env
+```
+
+### 11.2 安装依赖
+
+```powershell
 pip install -r requirements.txt
 ```
 
-如果项目使用 `pyproject.toml`：
+### 11.3 准备配置
+
+复制示例配置：
 
 ```powershell
-pip install -e .
+copy config\settings.example.env .env
 ```
 
-### 13.2 配置环境变量
+在 `.env` 中填写：
 
-复制配置模板：
+- `SYMBOL=BTCUSDT`
+- `INTERVAL=1m`
+- `PREDICTION_MINUTES=10`
+- `ARIMA_ORDER=1,0,1`
+- `TRAIN_WINDOW=1440`
+- `CONFIDENCE_THRESHOLD=0.70`
+- `TELEGRAM_BOT_TOKEN=你的 Telegram Bot Token`
+- `TELEGRAM_CHAT_ID=你的 Telegram Chat ID`
+- `DRY_RUN=true`
+
+如果只使用公开行情数据，Binance API Key 可以不是第一版必需项。若后续接入更高限额或私有接口，再加入 Key 管理。
+
+### 11.4 下载历史数据
 
 ```powershell
-Copy-Item .env.example .env
+python -m src.data.download_klines --symbol BTCUSDT --interval 1m --start 2026-01-01 --end 2026-02-01
 ```
 
-编辑 `.env`：
+下载后检查：
 
-```text
-BINANCE_MARKET=spot
-BINANCE_SYMBOL=BTCUSDT
-BINANCE_INTERVAL=1m
-PREDICTION_HORIZON_MINUTES=10
-TRAIN_WINDOW=2000
-ARIMA_ORDER=2,0,2
-MIN_CONFIDENCE=0.63
-MIN_EXPECTED_RETURN=0.0005
-SIGNAL_COOLDOWN_MINUTES=10
-TELEGRAM_BOT_TOKEN=你的telegram_bot_token
-TELEGRAM_CHAT_ID=你的chat_id
-```
+- `data/raw/` 中是否生成数据文件。
+- 时间戳是否连续。
+- 是否存在重复 K 线。
+- 收盘价、成交量是否为空。
 
-Telegram Bot 获取方式：
-
-1. 在 Telegram 中找 `@BotFather` 创建 bot。
-2. 获取 Bot Token。
-3. 给 bot 发送一条消息，或把 bot 加入目标群。
-4. 使用 Telegram API 或项目提供的测试命令获取 `chat_id`。
-5. 将 Token 和 Chat ID 写入 `.env`。
-
-### 13.3 回填历史 K 线
-
-建议至少回填 30 天以上 1 分钟 K 线；如果要做更稳定的回测，建议回填 3-12 个月。
+### 11.5 运行回测
 
 ```powershell
-python -m event_predictor.cli backfill --symbol BTCUSDT --interval 1m --start 2026-01-01 --end 2026-05-22
+python -m src.backtest.run_backtest --symbol BTCUSDT --data data/raw/BTCUSDT_1m.csv --prediction-minutes 10
 ```
 
-检查输出中是否存在缺口。如果缺口较多，应先补齐数据再回测。
+回测结束后查看：
 
-### 13.4 运行回测
+- `data/backtest/` 中的结果文件。
+- 总信号数量是否过少或过多。
+- 胜率是否显著高于随机基准。
+- 最大连错是否可以接受。
+- 信号是否集中在少数极端行情中。
+
+若回测不稳定，应先调低交易频率或提高置信度阈值，不应开启实时提醒。
+
+### 11.6 测试 Telegram
 
 ```powershell
-python -m event_predictor.cli backtest --symbol BTCUSDT --interval 1m --horizon 10 --train-window 2000
+python -m src.notify.telegram --test
 ```
 
-重点查看：
-
-- 高置信度信号胜率是否明显高于 50%。
-- 每天信号数量是否合理。
-- 最大连续失败次数是否可接受。
-- UP 和 DOWN 是否严重偏向某一侧。
-- 不同月份表现是否稳定。
-
-如果结果不理想，优先调整：
-
-- `ARIMA_ORDER`
-- `TRAIN_WINDOW`
-- `MIN_CONFIDENCE`
-- `MIN_EXPECTED_RETURN`
-- `SIGNAL_COOLDOWN_MINUTES`
-
-### 13.5 测试 Telegram 推送
-
-```powershell
-python -m event_predictor.cli test-telegram
-```
-
-预期结果：Telegram 收到一条测试消息。若失败，检查：
+如果没有收到消息，依次检查：
 
 - Bot Token 是否正确。
 - Chat ID 是否正确。
-- bot 是否有群发言权限。
-- 本地网络是否能访问 Telegram API。
+- 是否已经向 Bot 发送过 `/start`。
+- 当前网络是否能访问 Telegram API。
 
-### 13.6 启动实时信号服务
+### 11.7 实时运行
+
+建议先用 dry-run 模式运行：
 
 ```powershell
-python -m event_predictor.cli run
+python -m src.app --mode live --dry-run
 ```
 
-服务启动后应每分钟检查一次最新闭合 K 线。只有当 ARIMA 预测方向明确且满足置信度阈值时，Telegram 才会收到开仓参考信号。
+确认数据、模型和日志正常后，再允许推送真实 Telegram 信号：
 
-建议先用小窗口观察至少数天，不要直接根据未验证信号投入大额资金。
+```powershell
+python -m src.app --mode live
+```
 
-### 13.7 常见问题排查
+实时运行时应关注：
 
-#### 没有收到任何信号
+- 是否每分钟更新数据。
+- 是否有 API 限频或断线。
+- 是否持续出现模型拟合失败。
+- Telegram 信号是否过于频繁。
+- 信号方向是否与回测表现一致。
 
-- `MIN_CONFIDENCE` 可能过高。
-- `MIN_EXPECTED_RETURN` 可能过高。
-- 冷却时间过长。
-- 当前行情震荡，ARIMA 没有给出足够明确方向。
-- Telegram 配置不正确。
+### 11.8 日志查看
 
-#### 信号过多
+日志建议写入：
 
-- 提高 `MIN_CONFIDENCE`。
-- 提高 `MIN_EXPECTED_RETURN`。
-- 增加 `SIGNAL_COOLDOWN_MINUTES`。
-- 检查是否对未闭合 K 线重复生成信号。
+```text
+logs/app.log
+logs/data.log
+logs/model.log
+logs/signal.log
+logs/telegram.log
+```
 
-#### 回测胜率接近 50%
+出现异常时优先查看：
 
-- 当前 ARIMA 模型可能没有有效预测力。
-- 训练窗口或 ARIMA 参数不合适。
-- 10 分钟周期噪声过大。
-- 需要先降低实盘预期，继续作为研究基线，而不是贸然使用。
+1. 数据采集日志。
+2. 模型拟合日志。
+3. 信号过滤日志。
+4. Telegram 推送日志。
 
-#### 模型经常拟合失败
+### 11.9 日常维护
 
-- 检查 K 线是否缺失或重复。
-- 缩短或延长训练窗口。
-- 限制 ARIMA 参数阶数。
-- 对异常价格或极端收益做清洗。
+建议维护节奏：
 
-## 14. 验收标准
+- 每日检查实时运行日志和 Telegram 推送状态。
+- 每周用最新数据重新回测一次。
+- 每月重新评估 ARIMA 参数、训练窗口和置信度阈值。
+- 遇到剧烈行情、交易所接口变化或信号连续失效时，暂停实时提醒并重新回测。
 
-实现完成后，至少满足以下条件才算可进入观察运行：
+## 12. 风险提示
 
-- 可以成功回填指定交易对的 1 分钟 K 线。
-- 本地数据按时间排序、无重复，并能报告缺口。
-- ARIMA 预测只使用历史数据，没有未来数据泄露。
-- 回测结果能输出信号胜率、信号数量、置信度分桶胜率和最大连续失败次数。
-- 低置信度、低预测幅度、冷却期内的预测不会推送 Telegram。
-- Telegram 测试消息和真实信号消息都能送达。
-- `.env` 不提交，Token 不出现在日志中。
-- 实时服务遇到网络错误、模型错误、Telegram 错误时不会直接崩溃。
-- README 中明确包含安装、配置、回填、回测、启动和风险提示。
+ARIMA 是线性统计模型，对短周期加密市场中的突发消息、非线性波动和盘口冲击捕捉能力有限。该工具只能作为辅助提醒，不能作为稳定盈利保证。
 
-## 15. 风险提示
+上线前必须确认：
 
-ARIMA 是线性统计模型，无法稳定捕捉加密市场中的突发新闻、盘口冲击和非线性行为。10 分钟事件合约噪声很高，即使短期回测有效，也可能在市场状态变化后迅速失效。
+- 回测没有未来函数。
+- Telegram 推送只作为人工决策参考。
+- 用户自行承担事件合约参与风险。
+- 工具不保存明文敏感信息。
+- 所有使用行为符合当地监管和 Binance 服务条款。
 
-该工具输出的 Telegram 消息只能作为人工参考，不代表确定收益。事件合约可能损失全部投入本金。上线前必须先进行充分回测和小额观察，并设置每日最大亏损、最大交易次数和暂停条件。
+第一版应以“少发、准发、可解释”为原则。宁可输出更多“观望”，也不要为了提高信号数量而降低置信度门槛。
