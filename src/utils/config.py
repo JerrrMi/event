@@ -17,6 +17,7 @@ ALLOWED_INTERVALS = frozenset(
 )
 ALLOWED_BINANCE_MARKETS = frozenset({"spot", "futures"})
 ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+ALLOWED_ARIMA_SERIES_TYPES = frozenset({"log_return", "price_diff"})
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")
 TELEGRAM_TOKEN_PATTERN = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 
@@ -87,6 +88,12 @@ class Settings:
     interval: str
     prediction_minutes: int
     arima_order: Tuple[int, int, int]
+    arima_series_type: str
+    use_auto_arima: bool
+    auto_arima_max_p: int
+    auto_arima_max_q: int
+    auto_arima_max_d: int
+    direction_threshold: float
     train_window: int
     refit_interval_minutes: int
     confidence_threshold: float
@@ -121,6 +128,14 @@ class Settings:
             interval=os.getenv("INTERVAL", "1m"),
             prediction_minutes=_parse_int("PREDICTION_MINUTES", os.getenv("PREDICTION_MINUTES"), 10),
             arima_order=_parse_arima_order(os.getenv("ARIMA_ORDER")),
+            arima_series_type=os.getenv("ARIMA_SERIES_TYPE", "log_return").strip().lower(),
+            use_auto_arima=_parse_bool(os.getenv("USE_AUTO_ARIMA"), False),
+            auto_arima_max_p=_parse_int("AUTO_ARIMA_MAX_P", os.getenv("AUTO_ARIMA_MAX_P"), 5),
+            auto_arima_max_q=_parse_int("AUTO_ARIMA_MAX_Q", os.getenv("AUTO_ARIMA_MAX_Q"), 5),
+            auto_arima_max_d=_parse_int("AUTO_ARIMA_MAX_D", os.getenv("AUTO_ARIMA_MAX_D"), 2),
+            direction_threshold=_parse_float(
+                "DIRECTION_THRESHOLD", os.getenv("DIRECTION_THRESHOLD"), 0.0
+            ),
             train_window=_parse_int("TRAIN_WINDOW", os.getenv("TRAIN_WINDOW"), 1440),
             refit_interval_minutes=_parse_int(
                 "REFIT_INTERVAL_MINUTES", os.getenv("REFIT_INTERVAL_MINUTES"), 5
@@ -181,6 +196,22 @@ class Settings:
             errors.append(f"ARIMA_ORDER values must be non-negative, got: {self.arima_order}")
         if p + q > 10:
             errors.append(f"ARIMA_ORDER p + q should not exceed 10, got: {self.arima_order}")
+
+        if self.arima_series_type not in ALLOWED_ARIMA_SERIES_TYPES:
+            errors.append(
+                f"ARIMA_SERIES_TYPE must be one of {sorted(ALLOWED_ARIMA_SERIES_TYPES)}, "
+                f"got: {self.arima_series_type!r}"
+            )
+
+        if self.auto_arima_max_p < 0 or self.auto_arima_max_q < 0 or self.auto_arima_max_d < 0:
+            errors.append(
+                "AUTO_ARIMA_MAX_P, AUTO_ARIMA_MAX_Q and AUTO_ARIMA_MAX_D must be non-negative"
+            )
+
+        if self.direction_threshold < 0:
+            errors.append(
+                f"DIRECTION_THRESHOLD must be non-negative, got: {self.direction_threshold}"
+            )
 
         if self.train_window < self.prediction_minutes:
             errors.append(
