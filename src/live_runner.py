@@ -1,12 +1,12 @@
-"""Live trading loop: market data, ARIMA prediction, signals, and Telegram."""
+"""Live trading loop: market data, ARIMA-GARCH prediction, signals, and Telegram."""
 
 from __future__ import annotations
 
 import logging
 import signal
 import time
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, replace
+from typing import Optional, Union
 
 import pandas as pd
 
@@ -19,6 +19,12 @@ from src.models.arima_predictor import (
     ARIMAPredictionResult,
     predict_from_klines,
 )
+from src.models.garch_predictor import GARCHPredictorConfig, predict_volatility_from_klines
+from src.models.model_aggregator import (
+    AggregatorConfig,
+    CombinedPredictionResult,
+    aggregate_predictions,
+)
 from src.notify.telegram import TelegramNotifier
 from src.signals.signal_engine import SignalEngine, TradingSignal
 from src.utils.config import Settings
@@ -27,13 +33,15 @@ logger = logging.getLogger(__name__)
 model_logger = logging.getLogger("src.models")
 signal_logger = logging.getLogger("src.signals")
 
+PredictionResult = Union[ARIMAPredictionResult, CombinedPredictionResult]
+
 
 @dataclass(frozen=True)
 class LiveCycleResult:
     """Outcome of one live prediction cycle."""
 
     poll_result: PollResult
-    prediction: ARIMAPredictionResult
+    prediction: PredictionResult
     signal: TradingSignal
     refit_performed: bool
     telegram_sent: bool
@@ -41,11 +49,12 @@ class LiveCycleResult:
 
 class LiveTradingRunner:
     """
-    Orchestrate live data collection, ARIMA refit, signal evaluation, and alerts.
+    Orchestrate live data collection, model refit, signal evaluation, and alerts.
 
-    Refits the ARIMA model at most once per ``refit_interval_minutes``. Between refits,
-    the cached prediction is reused while order book and volume filters are re-evaluated
-    each cycle.
+    When ``use_garch`` is enabled, refits ARIMA and GARCH at most once per
+    ``refit_interval_minutes`` and caches the aggregated prediction. With GARCH disabled,
+    only ARIMA is fitted and cached. Between refits, the cached prediction is reused while
+    order book and volume filters are re-evaluated each cycle.
     """
 
     def __init__(
@@ -77,11 +86,13 @@ class LiveTradingRunner:
         )
 
         self.predictor_config = predictor_config or ARIMAPredictorConfig.from_settings(settings)
+        self.garch_config = GARCHPredictorConfig.from_settings(settings)
+        self.aggregator_config = AggregatorConfig.from_settings(settings)
         self.signal_engine = signal_engine or SignalEngine.from_settings(settings)
         self.notifier = notifier or TelegramNotifier.from_settings(settings, dry_run=self.dry_run)
 
         self._stop_requested = False
-        self._cached_prediction: Optional[ARIMAPredictionResult] = None
+        self._cached_prediction: Optional[PredictionResult] = None
         self._last_refit_monotonic: float = 0.0
         self._last_order_book: Optional[OrderBookSnapshot] = None
         self._latest_kline_timestamp: Optional[int] = None
@@ -150,7 +161,7 @@ class LiveTradingRunner:
 
         return False
 
-    def _run_prediction(self, klines: pd.DataFrame) -> ARIMAPredictionResult:
+    def _run_arima_prediction(self, klines: pd.DataFrame) -> ARIMAPredictionResult:
         result = predict_from_klines(
             klines,
             train_window=self.settings.train_window,
@@ -173,7 +184,52 @@ class LiveTradingRunner:
             )
         return result
 
-    def _apply_latest_price(self, prediction: ARIMAPredictionResult, klines: pd.DataFrame) -> ARIMAPredictionResult:
+    def _run_combined_prediction(self, klines: pd.DataFrame) -> CombinedPredictionResult:
+        arima = self._run_arima_prediction(klines)
+        garch = predict_volatility_from_klines(
+            klines,
+            train_window=self.settings.train_window,
+            config=self.garch_config,
+        )
+        if garch.success:
+            model_logger.info(
+                "GARCH volatility %s cumulative_vol=%.6f level=%s order=%s",
+                self.settings.symbol,
+                garch.cumulative_volatility or 0.0,
+                garch.volatility_level,
+                garch.model_order,
+            )
+        else:
+            model_logger.warning(
+                "GARCH volatility failed for %s: %s (%s)",
+                self.settings.symbol,
+                garch.error_message,
+                garch.error_code,
+            )
+
+        combined = aggregate_predictions(arima, garch, config=self.aggregator_config)
+        model_logger.info(
+            "ARIMA-GARCH aggregation %s arima_direction=%s garch_vol=%s "
+            "volatility_level=%s direction=%s adjusted_snr=%s",
+            self.settings.symbol,
+            combined.arima_direction,
+            combined.garch_volatility,
+            combined.volatility_level,
+            combined.direction,
+            combined.adjusted_snr,
+        )
+        return combined
+
+    def _run_prediction(self, klines: pd.DataFrame) -> PredictionResult:
+        if self.settings.use_garch:
+            return self._run_combined_prediction(klines)
+        return self._run_arima_prediction(klines)
+
+    def _apply_latest_price(
+        self,
+        prediction: PredictionResult,
+        klines: pd.DataFrame,
+    ) -> PredictionResult:
         """Refresh current_price on a cached prediction from the latest close."""
         if klines.empty or not prediction.success:
             return prediction
@@ -181,6 +237,9 @@ class LiveTradingRunner:
         latest_close = float(klines.iloc[-1]["close"])
         if prediction.current_price == latest_close:
             return prediction
+
+        if isinstance(prediction, CombinedPredictionResult):
+            return replace(prediction, current_price=latest_close)
 
         return ARIMAPredictionResult(
             success=prediction.success,
@@ -216,7 +275,7 @@ class LiveTradingRunner:
             self._last_refit_monotonic = time.monotonic()
         else:
             prediction = self._apply_latest_price(self._cached_prediction, klines)
-            model_logger.debug("Reusing cached ARIMA prediction for %s", self.settings.symbol)
+            model_logger.debug("Reusing cached prediction for %s", self.settings.symbol)
 
         timestamp_ms = latest_ts or int(time.time() * 1000)
         orderbook = poll_result.order_book or self._last_order_book

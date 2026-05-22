@@ -12,6 +12,8 @@ from src.data.live_collector import PollResult
 from src.data.order_book_schema import OrderBookSnapshot
 from src.live_runner import LiveTradingRunner
 from src.models.arima_predictor import ARIMAPredictionResult, DIRECTION_UP
+from src.models.garch_predictor import GARCHPredictionResult, VolatilityLevel
+from src.models.model_aggregator import CombinedPredictionResult
 from src.signals.signal_engine import SIGNAL_UP, TradingSignal
 from src.utils.config import Settings
 
@@ -64,6 +66,17 @@ def _make_settings(**overrides) -> Settings:
         direction_threshold=0.0,
         train_window=60,
         refit_interval_minutes=5,
+        use_garch=False,
+        garch_order=(1, 1),
+        garch_mean="constant",
+        garch_dist="normal",
+        garch_min_train_points=50,
+        garch_vol_scale=1.0,
+        garch_failure_mode="hold",
+        aggregation_mode="volatility_adjusted_arima",
+        aggregation_min_snr=0.8,
+        garch_extreme_vol_action="hold",
+        garch_vol_weight=0.35,
         confidence_threshold=0.70,
         signal_cooldown_minutes=10,
         max_spread_bps=50.0,
@@ -103,6 +116,42 @@ def _make_prediction(*, current_price: float = 100.59) -> ARIMAPredictionResult:
         prediction_horizon_minutes=10,
         forecast_steps=10,
         train_points=59,
+    )
+
+
+def _make_combined_prediction(*, current_price: float = 100.59) -> CombinedPredictionResult:
+    return CombinedPredictionResult(
+        success=True,
+        predicted_cumulative_return=0.002,
+        direction=DIRECTION_UP,
+        interval_lower=0.001,
+        interval_upper=0.003,
+        residual_volatility=0.0004,
+        model_order=(1, 0, 1),
+        series_type="log_return",
+        current_price=current_price,
+        prediction_horizon_minutes=10,
+        forecast_steps=10,
+        train_points=59,
+        arima_direction=DIRECTION_UP,
+        garch_volatility=0.001,
+        volatility_level=VolatilityLevel.NORMAL.value,
+        aggregation_mode="volatility_adjusted_arima",
+        adjusted_snr=2.0,
+    )
+
+
+def _make_garch_result() -> GARCHPredictionResult:
+    return GARCHPredictionResult(
+        success=True,
+        conditional_volatility=0.0002,
+        forecast_volatility=tuple([0.0002] * 10),
+        cumulative_volatility=0.001,
+        volatility_level=VolatilityLevel.NORMAL.value,
+        model_order=(1, 1),
+        train_points=59,
+        current_price=100.59,
+        prediction_horizon_minutes=10,
     )
 
 
@@ -185,6 +234,200 @@ def test_run_cycle_reuses_cached_prediction_when_refit_not_due() -> None:
     assert result.refit_performed is False
     assert result.prediction.current_price == pytest.approx(100.59)
     signal_engine.evaluate.assert_called_once()
+
+
+def test_run_cycle_aggregates_arima_garch_when_use_garch_enabled() -> None:
+    settings = _make_settings(use_garch=True)
+    source = MagicMock()
+    storage = MagicMock()
+    storage.load_klines.return_value = _make_klines(60)
+
+    collector = MagicMock()
+    collector.poll_once.return_value = PollResult(
+        klines_fetched=2,
+        klines_appended=1,
+        order_book_saved=True,
+        latest_kline_timestamp=1_700_000_060_000,
+        order_book_timestamp=1_700_000_060_000,
+        order_book=_make_order_book(),
+    )
+
+    signal_engine = MagicMock()
+    signal_engine.evaluate.return_value = _make_signal(should_push=False)
+    notifier = MagicMock()
+
+    runner = LiveTradingRunner(
+        settings,
+        source,
+        storage,
+        collector=collector,
+        signal_engine=signal_engine,
+        notifier=notifier,
+        dry_run=True,
+    )
+
+    arima = _make_prediction()
+    garch = _make_garch_result()
+    combined = _make_combined_prediction()
+
+    with (
+        patch("src.live_runner.predict_from_klines", return_value=arima) as mock_arima,
+        patch("src.live_runner.predict_volatility_from_klines", return_value=garch) as mock_garch,
+        patch("src.live_runner.aggregate_predictions", return_value=combined) as mock_aggregate,
+    ):
+        result = runner.run_cycle()
+
+    mock_arima.assert_called_once()
+    mock_garch.assert_called_once()
+    mock_aggregate.assert_called_once_with(arima, garch, config=runner.aggregator_config)
+    assert isinstance(result.prediction, CombinedPredictionResult)
+    assert result.prediction.adjusted_snr == pytest.approx(2.0)
+    assert result.refit_performed is True
+    signal_engine.evaluate.assert_called_once_with(
+        combined,
+        symbol=settings.symbol,
+        timestamp_ms=1_700_000_060_000,
+        klines=storage.load_klines.return_value,
+        orderbook=_make_order_book(),
+    )
+
+
+def test_run_cycle_use_garch_false_skips_garch_and_aggregator() -> None:
+    settings = _make_settings(use_garch=False)
+    source = MagicMock()
+    storage = MagicMock()
+    storage.load_klines.return_value = _make_klines(60)
+
+    collector = MagicMock()
+    collector.poll_once.return_value = PollResult(
+        klines_fetched=2,
+        klines_appended=1,
+        order_book_saved=True,
+        latest_kline_timestamp=1_700_000_060_000,
+        order_book_timestamp=1_700_000_060_000,
+        order_book=_make_order_book(),
+    )
+
+    signal_engine = MagicMock()
+    signal_engine.evaluate.return_value = _make_signal(should_push=False)
+    notifier = MagicMock()
+
+    runner = LiveTradingRunner(
+        settings,
+        source,
+        storage,
+        collector=collector,
+        signal_engine=signal_engine,
+        notifier=notifier,
+        dry_run=True,
+    )
+
+    with (
+        patch("src.live_runner.predict_from_klines", return_value=_make_prediction()) as mock_arima,
+        patch("src.live_runner.predict_volatility_from_klines") as mock_garch,
+        patch("src.live_runner.aggregate_predictions") as mock_aggregate,
+    ):
+        result = runner.run_cycle()
+
+    mock_arima.assert_called_once()
+    mock_garch.assert_not_called()
+    mock_aggregate.assert_not_called()
+    assert isinstance(result.prediction, ARIMAPredictionResult)
+
+
+def test_run_cycle_reuses_cached_combined_prediction_when_refit_not_due() -> None:
+    settings = _make_settings(use_garch=True, refit_interval_minutes=60)
+    source = MagicMock()
+    storage = MagicMock()
+    storage.load_klines.return_value = _make_klines(60)
+
+    collector = MagicMock()
+    collector.poll_once.return_value = PollResult(
+        klines_fetched=2,
+        klines_appended=1,
+        order_book_saved=True,
+        latest_kline_timestamp=1_700_000_060_000,
+        order_book_timestamp=1_700_000_060_000,
+        order_book=_make_order_book(),
+    )
+
+    signal_engine = MagicMock()
+    signal_engine.evaluate.return_value = _make_signal(should_push=False)
+    notifier = MagicMock()
+
+    runner = LiveTradingRunner(
+        settings,
+        source,
+        storage,
+        collector=collector,
+        signal_engine=signal_engine,
+        notifier=notifier,
+        dry_run=True,
+    )
+
+    runner._cached_prediction = _make_combined_prediction()
+    runner._last_refit_monotonic = __import__("time").monotonic()
+
+    with (
+        patch("src.live_runner.predict_from_klines") as mock_arima,
+        patch("src.live_runner.predict_volatility_from_klines") as mock_garch,
+        patch("src.live_runner.aggregate_predictions") as mock_aggregate,
+    ):
+        result = runner.run_cycle()
+        mock_arima.assert_not_called()
+        mock_garch.assert_not_called()
+        mock_aggregate.assert_not_called()
+
+    assert result.refit_performed is False
+    assert isinstance(result.prediction, CombinedPredictionResult)
+    assert result.prediction.current_price == pytest.approx(100.59)
+
+
+def test_run_cycle_logs_aggregation_fields_when_use_garch_enabled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    settings = _make_settings(use_garch=True)
+    source = MagicMock()
+    storage = MagicMock()
+    storage.load_klines.return_value = _make_klines(60)
+
+    collector = MagicMock()
+    collector.poll_once.return_value = PollResult(
+        klines_fetched=2,
+        klines_appended=1,
+        order_book_saved=True,
+        latest_kline_timestamp=1_700_000_060_000,
+        order_book_timestamp=1_700_000_060_000,
+        order_book=_make_order_book(),
+    )
+
+    runner = LiveTradingRunner(
+        settings,
+        source,
+        storage,
+        collector=collector,
+        signal_engine=MagicMock(),
+        notifier=MagicMock(),
+        dry_run=True,
+    )
+
+    with (
+        patch("src.live_runner.predict_from_klines", return_value=_make_prediction()),
+        patch("src.live_runner.predict_volatility_from_klines", return_value=_make_garch_result()),
+        patch("src.live_runner.aggregate_predictions", return_value=_make_combined_prediction()),
+    ):
+        with caplog.at_level("INFO", logger="src.models"):
+            runner.run_cycle()
+
+    log_text = caplog.text
+    assert "ARIMA prediction" in log_text
+    assert "GARCH volatility" in log_text
+    assert "ARIMA-GARCH aggregation" in log_text
+    assert "arima_direction=UP" in log_text
+    assert "garch_vol=0.001" in log_text
+    assert "volatility_level=NORMAL" in log_text
+    assert "direction=UP" in log_text
+    assert "adjusted_snr=2.0" in log_text
 
 
 def test_run_cycle_pushes_telegram_when_not_dry_run() -> None:
