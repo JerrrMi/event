@@ -7,7 +7,7 @@ import logging
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -24,6 +24,12 @@ from src.models.arima_predictor import (
     ARIMAPredictionResult,
     predict_from_klines,
 )
+from src.models.garch_predictor import GARCHPredictorConfig, predict_volatility_from_klines
+from src.models.model_aggregator import (
+    AggregatorConfig,
+    CombinedPredictionResult,
+    aggregate_predictions,
+)
 from src.signals.signal_engine import (
     SIGNAL_DOWN,
     SIGNAL_HOLD,
@@ -34,6 +40,12 @@ from src.signals.signal_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+PredictionResult = Union[ARIMAPredictionResult, CombinedPredictionResult]
+PredictFn = Callable[..., PredictionResult]
+
+MODEL_SOURCE_ARIMA = "arima"
+MODEL_SOURCE_ARIMA_GARCH = "arima_garch"
 
 
 @dataclass(frozen=True)
@@ -48,7 +60,10 @@ class BacktestConfig:
     label_threshold: float = 0.0
     payout_ratio: float = 0.80
     arima_config: ARIMAPredictorConfig = field(default_factory=ARIMAPredictorConfig)
+    garch_config: GARCHPredictorConfig = field(default_factory=GARCHPredictorConfig)
+    aggregator_config: AggregatorConfig = field(default_factory=AggregatorConfig)
     signal_config: SignalEngineConfig = field(default_factory=SignalEngineConfig)
+    use_garch: bool = False
     apply_cooldown: bool = True
 
     def __post_init__(self) -> None:
@@ -79,7 +94,10 @@ class BacktestConfig:
             refit_interval_minutes=settings.refit_interval_minutes,
             label_threshold=settings.direction_threshold,
             arima_config=ARIMAPredictorConfig.from_settings(settings),
+            garch_config=GARCHPredictorConfig.from_settings(settings),
+            aggregator_config=AggregatorConfig.from_settings(settings),
             signal_config=SignalEngineConfig.from_settings(settings),
+            use_garch=getattr(settings, "use_garch", False),
             apply_cooldown=True,
         )
 
@@ -102,6 +120,13 @@ class BacktestRecord:
     model_refit: bool
     predicted_cumulative_return: Optional[float]
     should_push_telegram: bool
+    garch_success: bool = False
+    garch_volatility: Optional[float] = None
+    volatility_level: Optional[str] = None
+    aggregation_direction: Optional[str] = None
+    adjusted_snr: Optional[float] = None
+    aggregation_rejection_reasons: Optional[str] = None
+    model_source: str = MODEL_SOURCE_ARIMA
 
 
 @dataclass
@@ -146,6 +171,11 @@ class BacktestSummary:
     loss_count: int
     push_count: int
     daily_stats: list[DailyBacktestStats]
+    garch_success_count: int = 0
+    aggregation_hold_count: int = 0
+    extreme_vol_hold_count: int = 0
+    average_garch_volatility: Optional[float] = None
+    average_adjusted_snr: Optional[float] = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
@@ -157,6 +187,82 @@ def _prepare_klines(klines: pd.DataFrame) -> pd.DataFrame:
     from src.models.arima_predictor import _prepare_klines as prepare
 
     return prepare(klines)
+
+
+def make_aggregated_predict_fn(
+    *,
+    garch_config: GARCHPredictorConfig,
+    aggregator_config: AggregatorConfig,
+) -> PredictFn:
+    """Build a predict_fn that runs ARIMA, GARCH, and aggregation on past klines only."""
+
+    def predict_fn(
+        klines: pd.DataFrame,
+        *,
+        train_window: int,
+        config: ARIMAPredictorConfig,
+    ) -> CombinedPredictionResult:
+        arima = predict_from_klines(klines, train_window=train_window, config=config)
+        garch = predict_volatility_from_klines(
+            klines,
+            train_window=train_window,
+            config=garch_config,
+        )
+        return aggregate_predictions(arima, garch, config=aggregator_config)
+
+    return predict_fn
+
+
+def _resolve_predict_fn(
+    *,
+    config: BacktestConfig,
+    predict_fn: Optional[PredictFn],
+) -> PredictFn:
+    if predict_fn is not None:
+        return predict_fn
+    if config.use_garch:
+        return make_aggregated_predict_fn(
+            garch_config=config.garch_config,
+            aggregator_config=config.aggregator_config,
+        )
+    return predict_from_klines
+
+
+def _format_rejection_reasons(reasons: tuple[str, ...] | list[str] | None) -> Optional[str]:
+    if not reasons:
+        return None
+    return "; ".join(reasons)
+
+
+def _extract_backtest_prediction_fields(
+    prediction: PredictionResult,
+) -> dict:
+    """Map ARIMA or combined prediction into BacktestRecord diagnostic fields."""
+    if isinstance(prediction, CombinedPredictionResult):
+        garch_success = prediction.garch_volatility is not None
+        return {
+            "model_source": MODEL_SOURCE_ARIMA_GARCH,
+            "arima_direction": prediction.arima_direction if prediction.success else None,
+            "aggregation_direction": prediction.direction,
+            "garch_success": garch_success,
+            "garch_volatility": prediction.garch_volatility,
+            "volatility_level": prediction.volatility_level,
+            "adjusted_snr": prediction.adjusted_snr,
+            "aggregation_rejection_reasons": _format_rejection_reasons(
+                prediction.rejection_reasons
+            ),
+        }
+
+    return {
+        "model_source": MODEL_SOURCE_ARIMA,
+        "arima_direction": prediction.direction if prediction.success else None,
+        "aggregation_direction": prediction.direction if prediction.success else None,
+        "garch_success": False,
+        "garch_volatility": None,
+        "volatility_level": None,
+        "adjusted_snr": None,
+        "aggregation_rejection_reasons": None,
+    }
 
 
 def _truncate_orderbook(
@@ -319,6 +425,11 @@ def compute_backtest_summary(
         item.win_rate = item.wins / decided_daily if decided_daily else None
         daily_stats.append(item)
 
+    garch_volatilities = [
+        record.garch_volatility for record in records if record.garch_volatility is not None
+    ]
+    adjusted_snrs = [record.adjusted_snr for record in records if record.adjusted_snr is not None]
+
     return BacktestSummary(
         symbol=config.symbol,
         interval=config.interval,
@@ -344,6 +455,23 @@ def compute_backtest_summary(
         loss_count=losses,
         push_count=pushes,
         daily_stats=daily_stats,
+        garch_success_count=sum(1 for record in records if record.garch_success),
+        aggregation_hold_count=sum(
+            1
+            for record in records
+            if record.aggregation_direction == SIGNAL_HOLD
+        ),
+        extreme_vol_hold_count=sum(
+            1
+            for record in records
+            if record.aggregation_direction == SIGNAL_HOLD
+            and record.aggregation_rejection_reasons
+            and "extreme_volatility" in record.aggregation_rejection_reasons
+        ),
+        average_garch_volatility=(
+            float(np.mean(garch_volatilities)) if garch_volatilities else None
+        ),
+        average_adjusted_snr=(float(np.mean(adjusted_snrs)) if adjusted_snrs else None),
     )
 
 
@@ -378,15 +506,19 @@ def run_rolling_backtest(
     *,
     config: Optional[BacktestConfig] = None,
     orderbook: Optional[pd.DataFrame] = None,
-    predict_fn=predict_from_klines,
+    predict_fn: Optional[PredictFn] = None,
 ) -> tuple[list[BacktestRecord], BacktestSummary]:
     """
-    Walk forward minute-by-minute using only past bars for ARIMA training.
+    Walk forward minute-by-minute using only past bars for model training.
+
+    When ``use_garch`` is enabled (or an aggregated ``predict_fn`` is supplied),
+    ARIMA and GARCH share the same truncated history window before aggregation.
 
     Labels are computed from future prices for evaluation only and are never
     passed into model training or signal inputs.
     """
     cfg = config or BacktestConfig()
+    resolved_predict_fn = _resolve_predict_fn(config=cfg, predict_fn=predict_fn)
     frame = _prepare_klines(klines)
     if frame.empty:
         summary = compute_backtest_summary([], config=cfg)
@@ -404,7 +536,11 @@ def run_rolling_backtest(
         label_threshold=cfg.label_threshold,
     )
 
-    min_history = max(cfg.train_window, cfg.signal_config.volume_lookback + 1)
+    min_history = max(
+        cfg.train_window,
+        cfg.signal_config.volume_lookback + 1,
+        cfg.garch_config.min_train_points if cfg.use_garch else 0,
+    )
     last_index = len(frame) - cfg.prediction_minutes - 1
     start_index = min_history - 1
 
@@ -424,7 +560,7 @@ def run_rolling_backtest(
         signal_engine.cooldown = SignalCooldownTracker(cooldown_minutes=0)
 
     records: list[BacktestRecord] = []
-    cached_prediction: Optional[ARIMAPredictionResult] = None
+    cached_prediction: Optional[PredictionResult] = None
     steps_since_refit = cfg.refit_interval_minutes
 
     for index in range(start_index, last_index + 1):
@@ -435,7 +571,7 @@ def run_rolling_backtest(
 
         should_refit = cached_prediction is None or steps_since_refit >= cfg.refit_interval_minutes
         if should_refit:
-            cached_prediction = predict_fn(
+            cached_prediction = resolved_predict_fn(
                 history,
                 train_window=cfg.train_window,
                 config=cfg.arima_config,
@@ -446,6 +582,8 @@ def run_rolling_backtest(
 
         prediction = cached_prediction
         assert prediction is not None
+
+        prediction_fields = _extract_backtest_prediction_fields(prediction)
 
         signal: TradingSignal = signal_engine.evaluate(
             prediction,
@@ -474,7 +612,7 @@ def run_rolling_backtest(
                 index=index,
                 timestamp_ms=timestamp_ms,
                 current_price=current_price,
-                arima_direction=prediction.direction if prediction.success else None,
+                arima_direction=prediction_fields["arima_direction"],
                 signal_direction=signal.direction,
                 actual_direction=actual_direction,
                 future_log_return=future_log_return,
@@ -485,6 +623,13 @@ def run_rolling_backtest(
                 model_refit=should_refit,
                 predicted_cumulative_return=prediction.predicted_cumulative_return,
                 should_push_telegram=signal.should_push_telegram,
+                garch_success=prediction_fields["garch_success"],
+                garch_volatility=prediction_fields["garch_volatility"],
+                volatility_level=prediction_fields["volatility_level"],
+                aggregation_direction=prediction_fields["aggregation_direction"],
+                adjusted_snr=prediction_fields["adjusted_snr"],
+                aggregation_rejection_reasons=prediction_fields["aggregation_rejection_reasons"],
+                model_source=prediction_fields["model_source"],
             )
         )
 
@@ -504,6 +649,11 @@ def format_summary_report(summary: BacktestSummary) -> str:
         f"Total simulated minutes: {summary.total_minutes}",
         f"Evaluable minutes: {summary.evaluable_minutes}",
         f"ARIMA success count: {summary.arima_success_count}",
+        f"GARCH success count: {summary.garch_success_count}",
+        f"Aggregation hold count: {summary.aggregation_hold_count}",
+        f"Extreme volatility hold count: {summary.extreme_vol_hold_count}",
+        f"Average GARCH volatility: {_fmt_float(summary.average_garch_volatility)}",
+        f"Average adjusted SNR: {_fmt_float(summary.average_adjusted_snr)}",
         "",
         f"Signal count: {summary.signal_count}",
         f"Signal frequency: {summary.signal_frequency:.4f}",
@@ -540,3 +690,9 @@ def _fmt_rate(value: Optional[float]) -> str:
     if value is None:
         return "n/a"
     return f"{value:.2%}"
+
+
+def _fmt_float(value: Optional[float]) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.6f}"

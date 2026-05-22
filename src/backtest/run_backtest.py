@@ -13,6 +13,7 @@ import pandas as pd
 from src.backtest.rolling_backtest import (
     BacktestConfig,
     format_summary_report,
+    make_aggregated_predict_fn,
     run_rolling_backtest,
     save_backtest_results,
 )
@@ -40,7 +41,7 @@ def load_klines_csv(path: Path) -> pd.DataFrame:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run rolling ARIMA backtest on historical 1-minute klines.",
+        description="Run rolling ARIMA or ARIMA-GARCH backtest on historical 1-minute klines.",
     )
     parser.add_argument("--symbol", help="Trading symbol, default from .env")
     parser.add_argument("--data", type=Path, required=True, help="Path to kline CSV file")
@@ -79,6 +80,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print summary only, do not write result files",
     )
+    garch_group = parser.add_mutually_exclusive_group()
+    garch_group.add_argument(
+        "--use-garch",
+        action="store_true",
+        default=None,
+        help="Enable ARIMA-GARCH aggregated prediction (overrides USE_GARCH from .env)",
+    )
+    garch_group.add_argument(
+        "--no-garch",
+        action="store_true",
+        default=None,
+        help="Disable GARCH and run ARIMA-only backtest (overrides USE_GARCH from .env)",
+    )
     return parser
 
 
@@ -97,7 +111,23 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     arima_config = replace(config.arima_config, prediction_minutes=prediction_minutes)
+    garch_config = replace(
+        config.garch_config,
+        prediction_minutes=prediction_minutes,
+    )
+    aggregator_config = replace(
+        config.aggregator_config,
+        prediction_minutes=prediction_minutes,
+    )
     signal_config = replace(config.signal_config, prediction_minutes=prediction_minutes)
+
+    if args.use_garch:
+        use_garch = True
+    elif args.no_garch:
+        use_garch = False
+    else:
+        use_garch = config.use_garch
+
     config = BacktestConfig(
         symbol=symbol,
         interval=config.interval,
@@ -107,7 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         label_threshold=config.label_threshold,
         payout_ratio=config.payout_ratio,
         arima_config=arima_config,
+        garch_config=garch_config,
+        aggregator_config=aggregator_config,
         signal_config=signal_config,
+        use_garch=use_garch,
         apply_cooldown=config.apply_cooldown,
     )
 
@@ -117,16 +150,25 @@ def main(argv: list[str] | None = None) -> int:
         orderbook = pd.read_csv(args.orderbook)
 
     logger.info(
-        "Starting rolling backtest for %s with %s klines from %s",
+        "Starting rolling backtest for %s with %s klines from %s (use_garch=%s)",
         config.symbol,
         len(klines),
         args.data,
+        config.use_garch,
     )
+
+    predict_fn = None
+    if config.use_garch:
+        predict_fn = make_aggregated_predict_fn(
+            garch_config=config.garch_config,
+            aggregator_config=config.aggregator_config,
+        )
 
     records, summary = run_rolling_backtest(
         klines,
         config=config,
         orderbook=orderbook,
+        predict_fn=predict_fn,
     )
 
     report = format_summary_report(summary)
