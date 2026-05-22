@@ -18,6 +18,11 @@ ALLOWED_INTERVALS = frozenset(
 ALLOWED_BINANCE_MARKETS = frozenset({"spot", "futures"})
 ALLOWED_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 ALLOWED_ARIMA_SERIES_TYPES = frozenset({"log_return", "price_diff"})
+ALLOWED_GARCH_MEANS = frozenset({"constant", "zero"})
+ALLOWED_GARCH_DISTS = frozenset({"normal", "t"})
+ALLOWED_GARCH_FAILURE_MODES = frozenset({"hold", "fallback_to_arima"})
+ALLOWED_AGGREGATION_MODES = frozenset({"volatility_adjusted_arima"})
+ALLOWED_GARCH_EXTREME_VOL_ACTIONS = frozenset({"hold", "allow_with_penalty"})
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")
 TELEGRAM_TOKEN_PATTERN = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
 
@@ -73,6 +78,19 @@ def _parse_arima_order(value: Optional[str], default: Tuple[int, int, int] = (1,
     return order[0], order[1], order[2]
 
 
+def _parse_garch_order(value: Optional[str], default: Tuple[int, int] = (1, 1)) -> Tuple[int, int]:
+    if value is None or value.strip() == "":
+        return default
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 2:
+        raise ConfigError([f"GARCH_ORDER must have 2 comma-separated integers, got: {value!r}"])
+    try:
+        order = tuple(int(part) for part in parts)
+    except ValueError as exc:
+        raise ConfigError([f"GARCH_ORDER must contain integers only, got: {value!r}"]) from exc
+    return order[0], order[1]
+
+
 def _optional_str(value: Optional[str]) -> Optional[str]:
     if value is None:
         return None
@@ -96,6 +114,17 @@ class Settings:
     direction_threshold: float
     train_window: int
     refit_interval_minutes: int
+    use_garch: bool
+    garch_order: Tuple[int, int]
+    garch_mean: str
+    garch_dist: str
+    garch_min_train_points: int
+    garch_vol_scale: float
+    garch_failure_mode: str
+    aggregation_mode: str
+    aggregation_min_snr: float
+    garch_extreme_vol_action: str
+    garch_vol_weight: float
     confidence_threshold: float
     signal_cooldown_minutes: int
     max_spread_bps: float
@@ -140,6 +169,25 @@ class Settings:
             refit_interval_minutes=_parse_int(
                 "REFIT_INTERVAL_MINUTES", os.getenv("REFIT_INTERVAL_MINUTES"), 5
             ),
+            use_garch=_parse_bool(os.getenv("USE_GARCH"), True),
+            garch_order=_parse_garch_order(os.getenv("GARCH_ORDER")),
+            garch_mean=os.getenv("GARCH_MEAN", "constant").strip().lower(),
+            garch_dist=os.getenv("GARCH_DIST", "normal").strip().lower(),
+            garch_min_train_points=_parse_int(
+                "GARCH_MIN_TRAIN_POINTS", os.getenv("GARCH_MIN_TRAIN_POINTS"), 100
+            ),
+            garch_vol_scale=_parse_float("GARCH_VOL_SCALE", os.getenv("GARCH_VOL_SCALE"), 1.0),
+            garch_failure_mode=os.getenv("GARCH_FAILURE_MODE", "hold").strip().lower(),
+            aggregation_mode=os.getenv("AGGREGATION_MODE", "volatility_adjusted_arima")
+            .strip()
+            .lower(),
+            aggregation_min_snr=_parse_float(
+                "AGGREGATION_MIN_SNR", os.getenv("AGGREGATION_MIN_SNR"), 0.8
+            ),
+            garch_extreme_vol_action=os.getenv("GARCH_EXTREME_VOL_ACTION", "hold")
+            .strip()
+            .lower(),
+            garch_vol_weight=_parse_float("GARCH_VOL_WEIGHT", os.getenv("GARCH_VOL_WEIGHT"), 0.35),
             confidence_threshold=_parse_float(
                 "CONFIDENCE_THRESHOLD", os.getenv("CONFIDENCE_THRESHOLD"), 0.70
             ),
@@ -223,6 +271,57 @@ class Settings:
 
         if self.refit_interval_minutes < 1:
             errors.append(f"REFIT_INTERVAL_MINUTES must be at least 1, got: {self.refit_interval_minutes}")
+
+        p_garch, q_garch = self.garch_order
+        if min(p_garch, q_garch) < 0:
+            errors.append(f"GARCH_ORDER values must be non-negative, got: {self.garch_order}")
+
+        if self.garch_mean not in ALLOWED_GARCH_MEANS:
+            errors.append(
+                f"GARCH_MEAN must be one of {sorted(ALLOWED_GARCH_MEANS)}, got: {self.garch_mean!r}"
+            )
+
+        if self.garch_dist not in ALLOWED_GARCH_DISTS:
+            errors.append(
+                f"GARCH_DIST must be one of {sorted(ALLOWED_GARCH_DISTS)}, got: {self.garch_dist!r}"
+            )
+
+        if self.garch_min_train_points < 50:
+            errors.append(
+                f"GARCH_MIN_TRAIN_POINTS must be at least 50, got: {self.garch_min_train_points}"
+            )
+
+        if self.garch_vol_scale <= 0:
+            errors.append(f"GARCH_VOL_SCALE must be positive, got: {self.garch_vol_scale}")
+
+        if self.garch_failure_mode not in ALLOWED_GARCH_FAILURE_MODES:
+            errors.append(
+                f"GARCH_FAILURE_MODE must be one of {sorted(ALLOWED_GARCH_FAILURE_MODES)}, "
+                f"got: {self.garch_failure_mode!r}"
+            )
+
+        if self.aggregation_mode not in ALLOWED_AGGREGATION_MODES:
+            errors.append(
+                f"AGGREGATION_MODE must be one of {sorted(ALLOWED_AGGREGATION_MODES)}, "
+                f"got: {self.aggregation_mode!r}"
+            )
+
+        if self.aggregation_min_snr < 0:
+            errors.append(
+                f"AGGREGATION_MIN_SNR must be non-negative, got: {self.aggregation_min_snr}"
+            )
+
+        if self.garch_extreme_vol_action not in ALLOWED_GARCH_EXTREME_VOL_ACTIONS:
+            errors.append(
+                f"GARCH_EXTREME_VOL_ACTION must be one of "
+                f"{sorted(ALLOWED_GARCH_EXTREME_VOL_ACTIONS)}, "
+                f"got: {self.garch_extreme_vol_action!r}"
+            )
+
+        if not 0.0 <= self.garch_vol_weight <= 1.0:
+            errors.append(
+                f"GARCH_VOL_WEIGHT must be in [0.0, 1.0], got: {self.garch_vol_weight}"
+            )
 
         if not 0.0 < self.confidence_threshold <= 1.0:
             errors.append(
