@@ -18,6 +18,11 @@ from src.models.garch_predictor import (
     VolatilityLevel,
     predict_volatility_from_klines,
 )
+from src.models.model_aggregator import (
+    AggregatorConfig,
+    CombinedPredictionResult,
+    aggregate_predictions,
+)
 
 __all__ = [
     "ARIMAErrorCode",
@@ -29,8 +34,11 @@ __all__ = [
     "GARCHErrorCode",
     "GARCHPredictorConfig",
     "GARCHPredictionResult",
+    "AggregatorConfig",
+    "CombinedPredictionResult",
     "SeriesType",
     "VolatilityLevel",
+    "aggregate_predictions",
     "build_model_series",
     "predict_from_klines",
     "predict_volatility_from_klines",
