@@ -187,7 +187,52 @@ def test_combined_prediction_result_compatible_with_signal_engine() -> None:
 
 
 def test_aggregator_config_from_settings() -> None:
-    settings = Settings.from_environ()
+    base = Settings.from_environ()
+    settings = Settings(
+        symbol="BTCUSDT",
+        interval="1m",
+        prediction_minutes=10,
+        arima_order=(1, 0, 1),
+        arima_series_type="log_return",
+        use_auto_arima=False,
+        auto_arima_max_p=5,
+        auto_arima_max_q=5,
+        auto_arima_max_d=2,
+        direction_threshold=0.0,
+        train_window=1440,
+        refit_interval_minutes=5,
+        use_garch=True,
+        garch_order=(1, 1),
+        garch_mean="constant",
+        garch_dist="normal",
+        garch_min_train_points=100,
+        garch_vol_scale=1.0,
+        garch_failure_mode="hold",
+        aggregation_mode="volatility_adjusted_arima",
+        aggregation_min_snr=0.8,
+        garch_extreme_vol_action="hold",
+        garch_vol_weight=0.35,
+        confidence_threshold=0.70,
+        signal_cooldown_minutes=10,
+        max_spread_bps=50.0,
+        binance_market="spot",
+        binance_api_key=None,
+        binance_api_secret=None,
+        binance_testnet=False,
+        telegram_bot_token=None,
+        telegram_chat_id=None,
+        dry_run=True,
+        log_level="INFO",
+        live_poll_interval_seconds=10.0,
+        live_kline_limit=2,
+        live_max_retries=5,
+        live_retry_backoff=1.0,
+        live_max_consecutive_errors=10,
+        live_error_retry_delay_seconds=5.0,
+        data_dir=base.data_dir,
+        logs_dir=base.logs_dir,
+        project_root=base.project_root,
+    )
     config = AggregatorConfig.from_settings(settings)
 
     assert config.aggregation_mode == settings.aggregation_mode

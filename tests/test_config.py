@@ -346,9 +346,11 @@ def test_invalid_garch_extreme_vol_action_raises_config_error(
 
 
 def test_invalid_garch_vol_weight_raises_config_error(
-    tmp_path: Path, valid_env_content: str
+    tmp_path: Path, valid_env_content: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     env_file = _write_env(tmp_path / ".env", valid_env_content + "\nGARCH_VOL_WEIGHT=1.5")
 
     with pytest.raises(ConfigError, match="GARCH_VOL_WEIGHT"):
         load_settings(env_file=env_file)
+
+    monkeypatch.delenv("GARCH_VOL_WEIGHT", raising=False)
