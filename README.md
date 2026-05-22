@@ -1,10 +1,10 @@
-# 10 分钟事件合约 ARIMA 预测提醒工具
+# 10 分钟事件合约 ARIMA-GARCH 预测提醒工具
 
-基于 ARIMA 模型的 Binance 10 分钟事件合约 **预测提醒** 工具。本工具根据公开市场数据生成「涨 / 跌 / 观望」信号，并在置信度达到阈值时推送到 Telegram。
+基于 **ARIMA + GARCH** 的 Binance 10 分钟事件合约 **预测提醒** 工具。ARIMA 负责方向与均值预测，GARCH 负责条件波动率风险校正；二者经聚合器合并后，再经信号引擎输出「涨 / 跌 / 观望」，并在置信度达到阈值时推送到 Telegram。
 
 **重要：本工具只提供预测提醒，不构成投资建议，也不自动下单。** 完整说明见 [docs/RISK_DISCLAIMER.md](docs/RISK_DISCLAIMER.md)。
 
-详细实现计划见 [docs/基于ARIMA模型的10分钟事件合约预测工具的实现plan.md](docs/基于ARIMA模型的10分钟事件合约预测工具的实现plan.md)。
+详细实现计划见 [docs/基于ARIMA-GARCH模型的10分钟事件合约预测工具的实现plan.md](docs/基于ARIMA-GARCH模型的10分钟事件合约预测工具的实现plan.md)。原 ARIMA 单模型计划见 [docs/基于ARIMA模型的10分钟事件合约预测工具的实现plan.md](docs/基于ARIMA模型的10分钟事件合约预测工具的实现plan.md)。
 
 ---
 
@@ -51,12 +51,14 @@ conda activate arima-env
 pip install -r requirements.txt
 ```
 
+依赖包含 `statsmodels`（ARIMA）、`arch`（GARCH）、`pandas` 等，见 `requirements.txt`。
+
 ### 验证环境
 
 ```powershell
 conda activate arima-env
-python -c "import pandas, statsmodels; print('OK')"
-python -c "from src.utils.config import load_settings; print(load_settings().symbol)"
+python -c "import pandas, statsmodels, arch; print('OK')"
+python -c "from src.utils.config import load_settings; s=load_settings(); print(s.symbol, 'use_garch=', s.use_garch)"
 ```
 
 ---
@@ -85,6 +87,17 @@ copy .env.example .env
 | `TRAIN_WINDOW` | 是 | 训练窗口（1m K 线根数） | `1440` |
 | `REFIT_INTERVAL_MINUTES` | 否 | 模型重拟合间隔（分钟） | `5` |
 | `DIRECTION_THRESHOLD` | 否 | 涨跌方向幅度阈值 | `0.0` |
+| `USE_GARCH` | 否 | 是否启用 GARCH 与聚合（`false` 时退化为 ARIMA 单模型） | `true` |
+| `GARCH_ORDER` | 否 | GARCH 阶数 p,q | `1,1` |
+| `GARCH_MEAN` | 否 | 均值模型：`constant` 或 `zero` | `constant` |
+| `GARCH_DIST` | 否 | 残差分布：`normal` 或 `t` | `normal` |
+| `GARCH_MIN_TRAIN_POINTS` | 否 | GARCH 最少训练点数 | `100` |
+| `GARCH_VOL_SCALE` | 否 | 波动率缩放系数（>0） | `1.0` |
+| `GARCH_FAILURE_MODE` | 否 | GARCH 失败时：`hold`（观望）或 `fallback_to_arima` | `hold` |
+| `AGGREGATION_MODE` | 否 | 聚合模式（当前仅 `volatility_adjusted_arima`） | `volatility_adjusted_arima` |
+| `AGGREGATION_MIN_SNR` | 否 | 聚合最小调整后信噪比，低于则观望 | `0.8` |
+| `GARCH_EXTREME_VOL_ACTION` | 否 | 极端波动时：`hold` 或 `allow_with_penalty` | `hold` |
+| `GARCH_VOL_WEIGHT` | 否 | GARCH 在有效波动率中的权重 [0,1] | `0.35` |
 | `CONFIDENCE_THRESHOLD` | 是 | 推送最低置信度（0–1） | `0.70` |
 | `SIGNAL_COOLDOWN_MINUTES` | 否 | 同方向信号冷却时间 | `10` |
 | `MAX_SPREAD_BPS` | 否 | 盘口价差过滤（基点） | `50` |
@@ -100,7 +113,7 @@ copy .env.example .env
 
 ### 最小可运行配置
 
-仅下载历史数据或回测时，可不填 Telegram：
+仅下载历史数据或回测时，可不填 Telegram。默认启用 ARIMA-GARCH：
 
 ```env
 SYMBOL=BTCUSDT
@@ -108,9 +121,14 @@ INTERVAL=1m
 PREDICTION_MINUTES=10
 ARIMA_ORDER=1,0,1
 TRAIN_WINDOW=1440
+USE_GARCH=true
+GARCH_ORDER=1,1
+AGGREGATION_MIN_SNR=0.8
 CONFIDENCE_THRESHOLD=0.70
 DRY_RUN=true
 ```
+
+若只需 ARIMA 单模型（与旧版行为一致），设置 `USE_GARCH=false`。
 
 开启真实 Telegram 推送前，需补充 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`，并将 `DRY_RUN=false`（或使用 CLI `--no-dry-run`）。
 
@@ -151,31 +169,63 @@ python -m src.data.download_klines --symbol BTCUSDT --interval 1m --start 2026-0
 
 ## 回测
 
-在开启实时 Telegram 推送前，**必须先**完成无未来函数的滚动回测。
+在开启实时 Telegram 推送前，**必须先**完成无未来函数的滚动回测。默认按 `.env` 中 `USE_GARCH` 决定使用 ARIMA-GARCH 或 ARIMA 单模型。
+
+### ARIMA-GARCH 回测（默认）
 
 ```powershell
 conda activate arima-env
 python -m src.backtest.run_backtest --symbol BTCUSDT --data data/raw/BTCUSDT_1m.csv --prediction-minutes 10
 ```
 
+或显式启用：
+
+```powershell
+conda activate arima-env
+python -m src.backtest.run_backtest --symbol BTCUSDT --data data/raw/BTCUSDT_1m.csv --use-garch
+```
+
+### ARIMA 单模型回测（对比基线）
+
+```powershell
+conda activate arima-env
+python -m src.backtest.run_backtest --symbol BTCUSDT --data data/raw/BTCUSDT_1m.csv --no-garch
+```
+
+也可在 `.env` 中设置 `USE_GARCH=false` 后运行同一命令。建议对同一 CSV 分别跑 `--use-garch` 与 `--no-garch`，对比信号数、胜率与 GARCH 相关指标。
+
 可选：若已采集盘口数据，可附加 `--orderbook data/raw/BTCUSDT_orderbook.csv`。
 
-结果写入 `data/backtest/`，终端会打印摘要。关注指标：
+结果写入 `data/backtest/`（明细 CSV + 摘要 JSON），终端会打印摘要。除原有指标外，ARIMA-GARCH 回测还应关注：
 
-- 信号数与信号频率（是否过少/过多）
+| 指标 | 含义 |
+|------|------|
+| `garch_success_count` | GARCH 拟合成功次数 |
+| `aggregation_hold_count` | 聚合结果为观望的次数 |
+| `extreme_vol_hold_count` | 因极端波动被过滤的次数 |
+| `average_garch_volatility` | 平均 GARCH 累计波动率 |
+| `average_adjusted_snr` | 平均调整后信噪比 |
+
+明细 CSV 另含 `garch_volatility`、`volatility_level`、`aggregation_direction`、`adjusted_snr`、`model_source` 等字段，便于分析聚合拒绝原因。
+
+通用关注点：
+
+- 信号数与信号频率（ARIMA-GARCH 信号往往更少，属预期）
 - 涨/跌信号胜率、总胜率、平衡准确率
 - 最大连错次数
 - 简化收益模拟（仅作参考，非实盘保证）
 
-若胜率不稳定或接近随机，应提高 `CONFIDENCE_THRESHOLD` 或延长训练窗口，**不要**急于开启实时提醒。
+若胜率不稳定或接近随机，应提高 `CONFIDENCE_THRESHOLD`、`AGGREGATION_MIN_SNR` 或延长训练窗口，**不要**急于开启实时提醒。
 
 ---
 
 ## 实时运行
 
-实时入口整合数据采集、ARIMA 预测、信号引擎与 Telegram 推送，支持日志、重试、Ctrl+C 优雅退出和 dry-run。
+实时入口整合数据采集、ARIMA 与 GARCH 预测、ARIMA-GARCH 聚合、信号引擎与 Telegram 推送，支持日志、重试、Ctrl+C 优雅退出和 dry-run。`USE_GARCH=false` 时仅运行 ARIMA 单模型。
 
 ### 第一步：dry-run 验证
+
+不调用真实 Telegram API，预测与信号逻辑仍会执行并写入日志：
 
 ```powershell
 conda activate arima-env
@@ -189,6 +239,8 @@ conda activate arima-env
 python -m src.app --mode live --dry-run --once
 ```
 
+dry-run 下可在 `logs/model.log` 中确认 ARIMA 方向、GARCH 波动率等级、聚合方向与 `adjusted_snr`；在 `logs/signal.log` 中确认过滤与冷却；在 `logs/telegram.log` 中应看到「跳过真实推送」类记录。
+
 ### 第二步：开启真实推送
 
 确认日志与信号逻辑正常后：
@@ -198,12 +250,14 @@ conda activate arima-env
 python -m src.app --mode live --no-dry-run
 ```
 
-或在 `.env` 设置 `DRY_RUN=false` 后：
+或在 `.env` 设置 `DRY_RUN=false` 并填写 Telegram 凭据后：
 
 ```powershell
 conda activate arima-env
 python -m src.app --mode live
 ```
+
+真实推送时，信号消息可能包含 `volatility_level`、`garch_vol`、`adjusted_snr` 及 ARIMA-GARCH 触发摘要；启动健康检查会标明当前为 ARIMA-GARCH 或 ARIMA 单模型。消息仍包含「不自动下单、需人工确认」提示。
 
 常用参数：
 
@@ -217,7 +271,7 @@ python -m src.app --mode live
 | `--no-health-check` | 跳过启动健康检查消息 |
 | `-v` | 调试日志 |
 
-仅采集行情（不跑 ARIMA 主循环）时，可使用：
+仅采集行情（不跑预测主循环）时，可使用：
 
 ```powershell
 conda activate arima-env
@@ -252,7 +306,7 @@ conda activate arima-env
 python -m src.notify.telegram --test
 ```
 
-成功时，Telegram 应收到包含标的、周期、置信度阈值和「不自动下单」提示的启动消息。
+成功时，Telegram 应收到包含标的、周期、模型模式（ARIMA-GARCH / ARIMA）、置信度阈值和「不自动下单」提示的启动消息。
 
 ---
 
@@ -264,24 +318,27 @@ python -m src.notify.telegram --test
 |------|------|
 | `logs/app.log` | 主程序、循环状态 |
 | `logs/data.log` | K 线/盘口采集、API 重试 |
-| `logs/model.log` | ARIMA 拟合与预测 |
-| `logs/signal.log` | 信号过滤、冷却、置信度 |
-| `logs/telegram.log` | 推送成功/失败、dry-run |
+| `logs/model.log` | **ARIMA** 拟合与预测；**GARCH** 条件波动率、波动率等级；**聚合** 方向、`adjusted_snr`、拒绝原因 |
+| `logs/signal.log` | 信号过滤、冷却、置信度、是否可推送 |
+| `logs/telegram.log` | 推送成功/失败、dry-run 跳过 |
+
+GARCH（`src.models.garch_predictor`）与聚合器（`src.models.model_aggregator`）均写入 `model.log`，与 ARIMA 同属 `src.models` 命名空间。
 
 PowerShell 查看最近日志：
 
 ```powershell
 Get-Content logs\app.log -Tail 50
-Get-Content logs\model.log -Tail 30
+Get-Content logs\model.log -Tail 40
+Get-Content logs\signal.log -Tail 30
 ```
 
-排查顺序建议：数据采集 → 模型拟合 → 信号过滤 → Telegram 推送。
+排查顺序建议：数据采集 → ARIMA/GARCH 拟合 → 聚合 → 信号过滤 → Telegram 推送。
 
 ---
 
 ## 测试
 
-项目使用 `pytest` 覆盖配置、下载、特征、ARIMA、信号、回测、Telegram、实时循环与应用入口。
+项目使用 `pytest` 覆盖配置、下载、特征、ARIMA、GARCH、聚合、信号、回测、Telegram、实时循环与应用入口。
 
 ### 运行全部测试
 
@@ -298,6 +355,8 @@ pytest tests/test_config.py -v
 pytest tests/test_download_klines.py -v
 pytest tests/test_features.py -v
 pytest tests/test_arima_predictor.py -v
+pytest tests/test_garch_predictor.py -v
+pytest tests/test_model_aggregator.py -v
 pytest tests/test_signal_engine.py -v
 pytest tests/test_backtest.py -v
 pytest tests/test_telegram.py -v
@@ -307,13 +366,15 @@ pytest tests/test_app.py -v
 
 ### 测试范围说明
 
-- **配置**：`.env` 解析、校验、敏感项缺失提示
+- **配置**：`.env` 解析、GARCH/聚合校验、敏感项缺失提示
 - **数据**：K 线分页/去重、实时采集、盘口字段
 - **特征**：无未来泄露、标签边界
-- **模型**：固定阶数预测、失败降级
-- **信号**：置信度、冷却、价差过滤
-- **回测**：滚动窗口、指标汇总
-- **通知**：消息格式含「不自动下单」「人工确认」
+- **ARIMA**：固定阶数预测、失败降级
+- **GARCH**：对数收益拟合、数据不足/拟合失败不抛异常、配置校验
+- **聚合**：ARIMA+GARCH 合并、极端波动与 `adjusted_snr` 观望、`fallback_to_arima`
+- **信号**：置信度、冷却、价差过滤、ARIMA-GARCH 触发摘要
+- **回测**：滚动窗口、GARCH 字段落盘、`--use-garch` / `--no-garch`
+- **通知**：消息格式含「不自动下单」「人工确认」、波动率等级展示
 - **应用**：CLI dry-run 解析、单轮 live 冒烟
 
 Telegram 相关测试默认 **mock HTTP**，不会向真实 Bot 发消息。
@@ -326,7 +387,7 @@ Telegram 相关测试默认 **mock HTTP**，不会向真实 Bot 发消息。
 
 执行 `conda init powershell` 后重启终端；或从开始菜单打开 **Anaconda Prompt**，再 `conda activate arima-env`。
 
-### `pip install` 或 `statsmodels` 安装失败
+### `pip install` 或 `arch` / `statsmodels` 安装失败
 
 确认已激活 `arima-env`，并使用该环境下的 `pip`：`where python`、`where pip` 应指向 `arima-env`。
 
@@ -336,11 +397,15 @@ Telegram 相关测试默认 **mock HTTP**，不会向真实 Bot 发消息。
 
 ### 回测报错「缺少列」或「数据不足」
 
-确认 CSV 包含完整 K 线字段；`TRAIN_WINDOW + PREDICTION_MINUTES` 应小于 K 线总行数；建议至少 30 天 `1m` 数据。
+确认 CSV 包含完整 K 线字段；`TRAIN_WINDOW + PREDICTION_MINUTES` 应小于 K 线总行数；GARCH 还需满足 `GARCH_MIN_TRAIN_POINTS`；建议至少 30 天 `1m` 数据。
 
-### ARIMA 频繁拟合失败
+### ARIMA 或 GARCH 频繁拟合失败
 
-查看 `logs/model.log`；可增大 `TRAIN_WINDOW`、改用 `log_return`、关闭 `USE_AUTO_ARIMA`，或放宽 `REFIT_INTERVAL_MINUTES`。
+查看 `logs/model.log`；可增大 `TRAIN_WINDOW`、改用 `log_return`、关闭 `USE_AUTO_ARIMA`，或放宽 `REFIT_INTERVAL_MINUTES`。GARCH 失败且 `GARCH_FAILURE_MODE=hold` 时会输出观望，不中断实时循环。
+
+### 启用 GARCH 后信号明显变少
+
+属预期：GARCH 用于过滤高波动、低信噪比环境。可对比 `--no-garch` 回测；若聚合过严，可适当降低 `AGGREGATION_MIN_SNR`（需谨慎）或调整 `GARCH_EXTREME_VOL_ACTION`。
 
 ### Telegram 测试收不到消息
 
@@ -351,13 +416,13 @@ Telegram 相关测试默认 **mock HTTP**，不会向真实 Bot 发消息。
 
 ### 实时运行无信号推送
 
-- 多数时间为「观望」属正常；检查 `CONFIDENCE_THRESHOLD` 是否过高
+- 多数时间为「观望」属正常；检查 `CONFIDENCE_THRESHOLD`、`AGGREGATION_MIN_SNR` 是否过高
 - 确认 `DRY_RUN` 未误设为 `true`，且未同时传入 `--dry-run`
-- 查看 `logs/signal.log` 中的过滤原因（冷却、价差、成交量等）
+- 查看 `logs/signal.log` 中的过滤原因（冷却、价差、成交量、聚合拒绝等）
 
 ### 信号与回测表现差异大
 
-实时行情分布可能与历史样本不同；建议每周用最新数据重新回测，剧烈行情时暂停推送。
+实时行情分布可能与历史样本不同；建议每周用最新数据分别跑 ARIMA-GARCH 与 ARIMA 基线回测，剧烈行情时暂停推送。
 
 ---
 
@@ -370,13 +435,14 @@ event/
     processed/    # 特征数据
     backtest/     # 回测结果
   docs/
+    基于ARIMA-GARCH模型的10分钟事件合约预测工具的实现plan.md
     基于ARIMA模型的10分钟事件合约预测工具的实现plan.md
     RISK_DISCLAIMER.md
   logs/
   src/
     data/         # 下载与实时采集
     features/     # 特征与标签
-    models/       # ARIMA
+    models/       # ARIMA、GARCH、ARIMA-GARCH 聚合
     signals/      # 信号引擎
     notify/       # Telegram
     backtest/     # 滚动回测
@@ -396,8 +462,8 @@ event/
 **本工具只提供预测提醒，不构成投资建议，也不自动下单。**
 
 - 所有信号均需用户 **人工确认** 后再决定是否参与事件合约。
-- ARIMA 对短周期加密市场的非线性波动、消息面冲击捕捉能力有限。
-- 历史回测胜率 **不保证** 未来表现；上线实时推送前须完成无未来函数回测。
+- ARIMA 负责方向预测，GARCH 仅改善波动率风险过滤，**不保证** 预测盈利；二者均无法完整刻画加密市场非线性与消息面冲击。
+- 历史回测胜率 **不保证** 未来表现；上线实时推送前须完成无未来函数回测，并建议对比 ARIMA 与 ARIMA-GARCH。
 - 用户须自行承担交易风险，并遵守当地法规与 Binance 服务条款。
 
 完整条款见 **[docs/RISK_DISCLAIMER.md](docs/RISK_DISCLAIMER.md)**。
