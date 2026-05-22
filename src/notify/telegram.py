@@ -64,6 +64,24 @@ def format_price(price: Optional[float]) -> str:
     return f"{price:.8f}"
 
 
+def _garch_context_lines(signal: TradingSignal) -> list[str]:
+    """Optional ARIMA-GARCH diagnostic lines when present on the signal."""
+    lines: list[str] = []
+    if signal.volatility_level:
+        lines.append(
+            f"<b>波动等级:</b> {escape_html(signal.volatility_level)}"
+        )
+    if signal.garch_volatility is not None:
+        lines.append(
+            f"<b>GARCH 波动率:</b> {escape_html(f'{signal.garch_volatility:.6f}')}"
+        )
+    if signal.adjusted_snr is not None:
+        lines.append(
+            f"<b>调整后 SNR:</b> {escape_html(f'{signal.adjusted_snr:.3f}')}"
+        )
+    return lines
+
+
 def format_signal_message(signal: TradingSignal) -> str:
     """Build a Telegram HTML message for a trading signal."""
     direction_label = escape_html(format_direction(signal.direction))
@@ -86,6 +104,7 @@ def format_signal_message(signal: TradingSignal) -> str:
         f"<b>置信度:</b> {confidence}",
         f"<b>触发原因:</b> {trigger_reason}",
     ]
+    lines.extend(_garch_context_lines(signal))
 
     if signal.is_direction_reversal:
         lines.append("<b>备注:</b> 方向反转")
@@ -113,24 +132,40 @@ def format_health_check_message(
     dry_run: bool,
     train_window: int,
     arima_order: tuple[int, int, int],
+    use_garch: bool = True,
+    garch_order: Optional[tuple[int, int]] = None,
     extra_note: Optional[str] = None,
 ) -> str:
     """Build a startup health-check message."""
     mode = "dry-run（仅日志，不推送信号）" if dry_run else "live（允许推送信号）"
     order_text = f"({arima_order[0]}, {arima_order[1]}, {arima_order[2]})"
+    if use_garch:
+        title = "<b>✅ ARIMA-GARCH 预测工具已启动</b>"
+        model_line = "<b>预测模型:</b> ARIMA-GARCH 聚合"
+    else:
+        title = "<b>✅ ARIMA 预测工具已启动</b>"
+        model_line = "<b>预测模型:</b> ARIMA 单模型"
     lines = [
-        "<b>✅ ARIMA 预测工具已启动</b>",
+        title,
         "",
+        model_line,
         f"<b>标的:</b> {escape_html(symbol)}",
         f"<b>K 线周期:</b> {escape_html(interval)}",
         f"<b>预测窗口:</b> {prediction_minutes} 分钟",
         f"<b>训练窗口:</b> {train_window} 根 K 线",
         f"<b>ARIMA 阶数:</b> {escape_html(order_text)}",
-        f"<b>置信度阈值:</b> {confidence_threshold:.1%}",
-        f"<b>运行模式:</b> {escape_html(mode)}",
-        "",
-        "Telegram 通知通道正常，健康检查通过。",
     ]
+    if use_garch and garch_order is not None:
+        garch_text = f"({garch_order[0]}, {garch_order[1]})"
+        lines.append(f"<b>GARCH 阶数:</b> {escape_html(garch_text)}")
+    lines.extend(
+        [
+            f"<b>置信度阈值:</b> {confidence_threshold:.1%}",
+            f"<b>运行模式:</b> {escape_html(mode)}",
+            "",
+            "Telegram 通知通道正常，健康检查通过。",
+        ]
+    )
     if extra_note:
         lines.insert(2, f"<b>说明:</b> {escape_html(extra_note)}")
     return "\n".join(lines)
@@ -309,6 +344,8 @@ class TelegramNotifier:
             dry_run=self.dry_run,
             train_window=settings.train_window,
             arima_order=settings.arima_order,
+            use_garch=settings.use_garch,
+            garch_order=settings.garch_order if settings.use_garch else None,
             extra_note=extra_note,
         )
         logger.info("Sending Telegram health check for %s", settings.symbol)

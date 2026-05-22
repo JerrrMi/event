@@ -67,6 +67,17 @@ def _sample_settings(**overrides) -> Settings:
         "direction_threshold": 0.0,
         "train_window": 1440,
         "refit_interval_minutes": 5,
+        "use_garch": base.use_garch,
+        "garch_order": base.garch_order,
+        "garch_mean": base.garch_mean,
+        "garch_dist": base.garch_dist,
+        "garch_min_train_points": base.garch_min_train_points,
+        "garch_vol_scale": base.garch_vol_scale,
+        "garch_failure_mode": base.garch_failure_mode,
+        "aggregation_mode": base.aggregation_mode,
+        "aggregation_min_snr": base.aggregation_min_snr,
+        "garch_extreme_vol_action": base.garch_extreme_vol_action,
+        "garch_vol_weight": base.garch_vol_weight,
         "confidence_threshold": 0.70,
         "signal_cooldown_minutes": 10,
         "max_spread_bps": 50.0,
@@ -119,6 +130,34 @@ def test_format_signal_message_marks_direction_reversal() -> None:
     assert "方向反转" in message
 
 
+def test_format_signal_message_shows_garch_context_when_present() -> None:
+    message = format_signal_message(
+        _sample_signal(
+            trigger_summary="ARIMA-GARCH UP; confidence=0.820",
+            volatility_level="HIGH",
+            garch_volatility=0.001234,
+            adjusted_snr=1.25,
+        )
+    )
+
+    assert "波动等级:" in message
+    assert "HIGH" in message
+    assert "GARCH 波动率:" in message
+    assert "0.001234" in message
+    assert "调整后 SNR:" in message
+    assert "1.250" in message
+    assert "不自动下单" in message
+    assert "人工确认" in message
+
+
+def test_format_signal_message_omits_garch_context_when_absent() -> None:
+    message = format_signal_message(_sample_signal())
+
+    assert "波动等级:" not in message
+    assert "GARCH 波动率:" not in message
+    assert "调整后 SNR:" not in message
+
+
 def test_format_health_check_message_contains_runtime_info() -> None:
     settings = _sample_settings(dry_run=False)
     message = format_health_check_message(
@@ -129,13 +168,53 @@ def test_format_health_check_message_contains_runtime_info() -> None:
         dry_run=False,
         train_window=settings.train_window,
         arima_order=settings.arima_order,
+        use_garch=settings.use_garch,
+        garch_order=settings.garch_order,
     )
 
-    assert "ARIMA 预测工具已启动" in message
+    assert "ARIMA-GARCH 预测工具已启动" in message
+    assert "ARIMA-GARCH 聚合" in message
     assert "BTCUSDT" in message
     assert "1m" in message
     assert "70.0%" in message
     assert "live（允许推送信号）" in message
+
+
+def test_format_health_check_message_arima_only_mode() -> None:
+    settings = _sample_settings(use_garch=False)
+    message = format_health_check_message(
+        symbol=settings.symbol,
+        interval=settings.interval,
+        prediction_minutes=settings.prediction_minutes,
+        confidence_threshold=settings.confidence_threshold,
+        dry_run=True,
+        train_window=settings.train_window,
+        arima_order=settings.arima_order,
+        use_garch=False,
+    )
+
+    assert "ARIMA 预测工具已启动" in message
+    assert "ARIMA 单模型" in message
+    assert "ARIMA-GARCH" not in message
+    assert "GARCH 阶数:" not in message
+
+
+def test_format_health_check_message_includes_garch_order() -> None:
+    settings = _sample_settings(use_garch=True, garch_order=(1, 1))
+    message = format_health_check_message(
+        symbol=settings.symbol,
+        interval=settings.interval,
+        prediction_minutes=settings.prediction_minutes,
+        confidence_threshold=settings.confidence_threshold,
+        dry_run=True,
+        train_window=settings.train_window,
+        arima_order=settings.arima_order,
+        use_garch=True,
+        garch_order=settings.garch_order,
+    )
+
+    assert "GARCH 阶数:" in message
+    assert "(1, 1)" in message
 
 
 def test_format_alert_message_includes_exception_details() -> None:
@@ -265,6 +344,22 @@ def test_send_health_check_uses_settings_context() -> None:
     result = notifier.send_health_check(settings, extra_note="startup")
 
     assert result["dry_run"] is True
+
+
+def test_send_health_check_reflects_arima_only_settings() -> None:
+    notifier = TelegramNotifier(
+        bot_token="123456789:AAExampleTokenValue",
+        chat_id="987654321",
+        dry_run=True,
+    )
+    settings = _sample_settings(use_garch=False)
+
+    with patch.object(notifier, "send_message", wraps=notifier.send_message) as send_mock:
+        notifier.send_health_check(settings)
+
+    message = send_mock.call_args.args[0]
+    assert "ARIMA 单模型" in message
+    assert "GARCH 阶数:" not in message
 
 
 def test_main_test_requires_credentials(tmp_path, monkeypatch) -> None:
