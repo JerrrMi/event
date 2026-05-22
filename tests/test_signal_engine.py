@@ -10,6 +10,8 @@ import pytest
 
 from src.data.order_book_schema import OrderBookSnapshot
 from src.models.arima_predictor import ARIMAPredictionResult, DIRECTION_DOWN, DIRECTION_UP
+from src.models.garch_predictor import GARCHPredictionResult, VolatilityLevel
+from src.models.model_aggregator import AggregatorConfig, aggregate_predictions
 from src.signals.signal_engine import (
     SignalCooldownTracker,
     SignalEngine,
@@ -94,6 +96,52 @@ def _orderbook_snapshot(
         spread=spread,
         mid_price=mid_price,
         book_imbalance=book_imbalance,
+    )
+
+
+def _successful_garch(
+    *,
+    cumulative_volatility: float = 0.001,
+    volatility_level: str = VolatilityLevel.NORMAL.value,
+) -> GARCHPredictionResult:
+    return GARCHPredictionResult(
+        success=True,
+        conditional_volatility=0.0002,
+        forecast_volatility=tuple([0.0002] * 10),
+        cumulative_volatility=cumulative_volatility,
+        volatility_level=volatility_level,
+        model_order=(1, 1),
+        train_points=120,
+        current_price=100_000.0,
+        prediction_horizon_minutes=10,
+    )
+
+
+def _combined_prediction(
+    *,
+    direction: str = DIRECTION_UP,
+    predicted_return: float = 0.01,
+    interval_lower: float = 0.004,
+    interval_upper: float = 0.012,
+    residual_volatility: float = 0.0002,
+    cumulative_volatility: float = 0.001,
+    volatility_level: str = VolatilityLevel.NORMAL.value,
+):
+    arima = _successful_prediction(
+        direction=direction,
+        predicted_return=predicted_return,
+        interval_lower=interval_lower,
+        interval_upper=interval_upper,
+        residual_volatility=residual_volatility,
+    )
+    garch = _successful_garch(
+        cumulative_volatility=cumulative_volatility,
+        volatility_level=volatility_level,
+    )
+    return aggregate_predictions(
+        arima,
+        garch,
+        config=AggregatorConfig(aggregation_min_snr=0.8),
     )
 
 
@@ -321,6 +369,7 @@ def test_signal_engine_records_push_and_detects_reversal() -> None:
 
 
 def test_signal_engine_config_from_settings() -> None:
+    env = Settings.from_environ()
     settings = Settings(
         symbol="BTCUSDT",
         interval="1m",
@@ -334,6 +383,17 @@ def test_signal_engine_config_from_settings() -> None:
         direction_threshold=0.0001,
         train_window=1440,
         refit_interval_minutes=5,
+        use_garch=env.use_garch,
+        garch_order=env.garch_order,
+        garch_mean=env.garch_mean,
+        garch_dist=env.garch_dist,
+        garch_min_train_points=env.garch_min_train_points,
+        garch_vol_scale=env.garch_vol_scale,
+        garch_failure_mode=env.garch_failure_mode,
+        aggregation_mode=env.aggregation_mode,
+        aggregation_min_snr=env.aggregation_min_snr,
+        garch_extreme_vol_action=env.garch_extreme_vol_action,
+        garch_vol_weight=env.garch_vol_weight,
         confidence_threshold=0.75,
         signal_cooldown_minutes=15,
         max_spread_bps=40.0,
@@ -351,9 +411,9 @@ def test_signal_engine_config_from_settings() -> None:
         live_retry_backoff=1.0,
         live_max_consecutive_errors=10,
         live_error_retry_delay_seconds=5.0,
-        data_dir=Settings.from_environ().data_dir,
-        logs_dir=Settings.from_environ().logs_dir,
-        project_root=Settings.from_environ().project_root,
+        data_dir=env.data_dir,
+        logs_dir=env.logs_dir,
+        project_root=env.project_root,
     )
     config = SignalEngineConfig.from_settings(settings)
     engine = SignalEngine.from_settings(settings)
@@ -377,3 +437,139 @@ def test_interval_score_partial_when_bounds_straddle_zero() -> None:
         arima_direction=SIGNAL_UP,
     )
     assert components.interval == pytest.approx(0.6)
+
+
+def test_build_signal_arima_only_trigger_summary_uses_arima_label() -> None:
+    prediction = _successful_prediction(direction=DIRECTION_UP, predicted_return=0.01)
+    config = SignalEngineConfig(confidence_threshold=0.3, direction_threshold=0.0)
+    signal = build_trading_signal(
+        prediction,
+        symbol="BTCUSDT",
+        timestamp_ms=1_700_000_000_000,
+        config=config,
+        klines=_make_klines([100.0] * 30, volumes=[200.0] * 30),
+        orderbook=_orderbook_snapshot(),
+    )
+
+    assert signal.trigger_summary.startswith("ARIMA UP")
+    assert "ARIMA-GARCH" not in signal.trigger_summary
+    assert signal.garch_volatility is None
+    assert signal.volatility_level is None
+    assert signal.adjusted_snr is None
+
+
+def test_build_signal_combined_prediction_high_confidence() -> None:
+    combined = _combined_prediction()
+    config = SignalEngineConfig(confidence_threshold=0.3, direction_threshold=0.0)
+    signal = build_trading_signal(
+        combined,
+        symbol="BTCUSDT",
+        timestamp_ms=1_700_000_000_000,
+        config=config,
+        klines=_make_klines([100.0] * 30, volumes=[200.0] * 30),
+        orderbook=_orderbook_snapshot(spread_bps=3.0, book_imbalance=0.5),
+    )
+
+    assert signal.direction == SIGNAL_UP
+    assert signal.arima_direction == SIGNAL_UP
+    assert signal.confidence >= config.confidence_threshold
+    assert signal.should_push_telegram is True
+    assert signal.garch_volatility == pytest.approx(0.001)
+    assert signal.volatility_level == VolatilityLevel.NORMAL.value
+    assert signal.aggregation_mode == "volatility_adjusted_arima"
+    assert signal.adjusted_snr == pytest.approx(10.0)
+    assert "ARIMA-GARCH" in signal.trigger_summary
+    assert "volatility_level=NORMAL" in signal.trigger_summary
+    assert "adjusted_snr=" in signal.trigger_summary
+    assert "garch_vol=" in signal.trigger_summary
+
+
+def test_build_signal_combined_prediction_uses_garch_residual_volatility_for_snr() -> None:
+    arima = _successful_prediction(
+        direction=DIRECTION_UP,
+        predicted_return=0.002,
+        residual_volatility=0.00001,
+    )
+    garch = _successful_garch(cumulative_volatility=0.01)
+    combined = aggregate_predictions(arima, garch, config=AggregatorConfig(aggregation_min_snr=0.1))
+
+    arima_only_components, _, _, _, _ = compute_confidence_components(
+        arima,
+        config=SignalEngineConfig(),
+        arima_direction=SIGNAL_UP,
+    )
+    combined_components, _, _, _, _ = compute_confidence_components(
+        combined,
+        config=SignalEngineConfig(),
+        arima_direction=SIGNAL_UP,
+    )
+
+    assert combined.residual_volatility is not None
+    assert combined.residual_volatility > arima.residual_volatility
+    assert combined_components.snr < arima_only_components.snr
+
+
+def test_build_signal_combined_prediction_hold_from_aggregator() -> None:
+    combined = _combined_prediction(
+        predicted_return=0.0001,
+        cumulative_volatility=0.001,
+    )
+    config = SignalEngineConfig(confidence_threshold=0.1, direction_threshold=0.0)
+    signal = build_trading_signal(
+        combined,
+        symbol="BTCUSDT",
+        timestamp_ms=1_700_000_000_000,
+        config=config,
+        klines=_make_klines([100.0] * 30, volumes=[200.0] * 30),
+        orderbook=_orderbook_snapshot(),
+    )
+
+    assert signal.arima_direction == SIGNAL_UP
+    assert signal.direction == SIGNAL_HOLD
+    assert signal.should_push_telegram is False
+    assert "low_adjusted_snr" in signal.rejection_reasons
+    assert "ARIMA-GARCH" in signal.trigger_summary
+    assert "blocked: low_adjusted_snr" in signal.trigger_summary
+
+
+def test_build_signal_combined_prediction_extreme_volatility_hold() -> None:
+    arima = _successful_prediction(direction=DIRECTION_UP, predicted_return=0.002)
+    garch = _successful_garch(
+        cumulative_volatility=0.001,
+        volatility_level=VolatilityLevel.EXTREME.value,
+    )
+    combined = aggregate_predictions(
+        arima,
+        garch,
+        config=AggregatorConfig(aggregation_min_snr=0.1, garch_extreme_vol_action="hold"),
+    )
+    signal = build_trading_signal(
+        combined,
+        symbol="BTCUSDT",
+        timestamp_ms=1_700_000_000_000,
+        config=SignalEngineConfig(confidence_threshold=0.1),
+        klines=_make_klines([100.0] * 30, volumes=[200.0] * 30),
+        orderbook=_orderbook_snapshot(),
+    )
+
+    assert signal.direction == SIGNAL_HOLD
+    assert signal.should_push_telegram is False
+    assert "extreme_volatility" in signal.rejection_reasons
+    assert "volatility_level=EXTREME" in signal.trigger_summary
+    assert "blocked: extreme_volatility" in signal.trigger_summary
+
+
+def test_signal_engine_evaluate_combined_prediction() -> None:
+    engine = SignalEngine(config=SignalEngineConfig(confidence_threshold=0.2, signal_cooldown_minutes=0))
+    combined = _combined_prediction()
+    signal = engine.evaluate(
+        combined,
+        symbol="BTCUSDT",
+        timestamp_ms=1_700_000_000_000,
+        klines=_make_klines([100.0] * 30, volumes=[200.0] * 30),
+        orderbook=_orderbook_snapshot(),
+    )
+
+    assert signal.should_push_telegram is True
+    assert signal.aggregation_mode == "volatility_adjusted_arima"
+    assert "ARIMA-GARCH" in signal.trigger_summary

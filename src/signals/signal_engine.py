@@ -18,8 +18,11 @@ from src.models.arima_predictor import (
     DIRECTION_HOLD,
     DIRECTION_UP,
 )
+from src.models.model_aggregator import CombinedPredictionResult
 
 logger = logging.getLogger(__name__)
+
+PredictionInput = ARIMAPredictionResult | CombinedPredictionResult
 
 SIGNAL_UP = LABEL_UP
 SIGNAL_DOWN = LABEL_DOWN
@@ -147,6 +150,10 @@ class TradingSignal:
     components: ConfidenceComponents
     arima_direction: Optional[str] = None
     rejection_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    garch_volatility: Optional[float] = None
+    volatility_level: Optional[str] = None
+    aggregation_mode: Optional[str] = None
+    adjusted_snr: Optional[float] = None
 
     @property
     def is_actionable(self) -> bool:
@@ -330,6 +337,34 @@ def _score_spread(spread_bps: Optional[float], *, max_spread_bps: float) -> tupl
     return _clamp01(1.0 - 0.5 * spread_bps / max_spread_bps), True
 
 
+def _is_combined_prediction(prediction: PredictionInput) -> bool:
+    return isinstance(prediction, CombinedPredictionResult)
+
+
+def _resolve_arima_direction(prediction: PredictionInput) -> str:
+    if isinstance(prediction, CombinedPredictionResult):
+        return prediction.arima_direction or prediction.direction or SIGNAL_HOLD
+    return prediction.direction or SIGNAL_HOLD
+
+
+def _resolve_aggregated_direction(prediction: PredictionInput) -> str:
+    return prediction.direction or SIGNAL_HOLD
+
+
+def _extract_aggregation_fields(
+    prediction: PredictionInput,
+) -> tuple[Optional[float], Optional[str], Optional[str], Optional[float], Tuple[str, ...]]:
+    if not isinstance(prediction, CombinedPredictionResult):
+        return None, None, None, None, ()
+    return (
+        prediction.garch_volatility,
+        prediction.volatility_level,
+        prediction.aggregation_mode,
+        prediction.adjusted_snr,
+        prediction.rejection_reasons,
+    )
+
+
 def _score_imbalance(book_imbalance: Optional[float], *, direction: str) -> float:
     if book_imbalance is None or direction == SIGNAL_HOLD:
         return 0.5
@@ -342,7 +377,7 @@ def _score_imbalance(book_imbalance: Optional[float], *, direction: str) -> floa
 
 
 def compute_confidence_components(
-    prediction: ARIMAPredictionResult,
+    prediction: PredictionInput,
     *,
     config: SignalEngineConfig,
     klines: Optional[pd.DataFrame] = None,
@@ -392,7 +427,7 @@ def compute_confidence_components(
 
 
 def build_trading_signal(
-    prediction: ARIMAPredictionResult,
+    prediction: PredictionInput,
     *,
     symbol: str,
     timestamp_ms: int,
@@ -412,9 +447,23 @@ def build_trading_signal(
     expiry_ms = timestamp_ms + horizon_minutes * 60_000
     risk_note = "本工具仅提供预测提醒，不构成投资建议，请人工确认后再参与事件合约。"
 
+    is_combined = _is_combined_prediction(prediction)
+    garch_volatility, volatility_level, aggregation_mode, adjusted_snr, aggregation_reasons = (
+        _extract_aggregation_fields(prediction)
+    )
+
     if not prediction.success:
         empty = ConfidenceComponents(0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         message = prediction.error_message or "ARIMA prediction failed"
+        trigger_parts = [message]
+        if is_combined:
+            trigger_parts.insert(0, "ARIMA-GARCH")
+            if volatility_level:
+                trigger_parts.append(f"volatility_level={volatility_level}")
+            if adjusted_snr is not None:
+                trigger_parts.append(f"adjusted_snr={adjusted_snr:.3f}")
+            if aggregation_reasons:
+                trigger_parts.append("blocked: " + "; ".join(aggregation_reasons))
         return TradingSignal(
             symbol=symbol,
             timestamp_ms=timestamp_ms,
@@ -432,14 +481,18 @@ def build_trading_signal(
             volume_filter_passed=False,
             spread_filter_passed=False,
             cooldown_blocked=False,
-            trigger_summary=message,
+            trigger_summary="; ".join(trigger_parts),
             risk_note=risk_note,
             components=empty,
             arima_direction=None,
-            rejection_reasons=(message,),
+            rejection_reasons=tuple(aggregation_reasons) or (message,),
+            garch_volatility=garch_volatility,
+            volatility_level=volatility_level,
+            aggregation_mode=aggregation_mode,
+            adjusted_snr=adjusted_snr,
         )
 
-    arima_direction = prediction.direction or SIGNAL_HOLD
+    arima_direction = _resolve_arima_direction(prediction)
     components, volume_passed, spread_passed, spread_bps, book_imbalance = (
         compute_confidence_components(
             prediction,
@@ -451,20 +504,23 @@ def build_trading_signal(
     )
     confidence = _clamp01(components.weighted_score(cfg.component_weights))
 
-    rejection_reasons: list[str] = []
-    if arima_direction == SIGNAL_HOLD:
+    rejection_reasons: list[str] = list(aggregation_reasons)
+    if arima_direction == SIGNAL_HOLD and not is_combined:
         rejection_reasons.append("predicted move below direction threshold")
     if not volume_passed:
         rejection_reasons.append("volume below minimum relative to recent median")
     if not spread_passed:
         rejection_reasons.append("order book spread exceeds configured maximum")
 
-    direction = arima_direction
-    if rejection_reasons and arima_direction in {SIGNAL_UP, SIGNAL_DOWN}:
+    direction = _resolve_aggregated_direction(prediction) if is_combined else arima_direction
+    if not is_combined and rejection_reasons and arima_direction in {SIGNAL_UP, SIGNAL_DOWN}:
         direction = SIGNAL_HOLD
+    elif is_combined and direction in {SIGNAL_UP, SIGNAL_DOWN}:
+        if not volume_passed or not spread_passed:
+            direction = SIGNAL_HOLD
 
     meets_threshold = confidence >= cfg.confidence_threshold
-    if not meets_threshold and arima_direction in {SIGNAL_UP, SIGNAL_DOWN}:
+    if not meets_threshold and direction in {SIGNAL_UP, SIGNAL_DOWN}:
         rejection_reasons.append(
             f"confidence {confidence:.3f} below threshold {cfg.confidence_threshold:.3f}"
         )
@@ -487,13 +543,25 @@ def build_trading_signal(
             f"cooldown active for {symbol} {arima_direction} ({cfg.signal_cooldown_minutes} min)"
         )
 
-    trigger_parts = [
-        f"ARIMA {arima_direction}",
-        f"confidence={confidence:.3f}",
-        f"magnitude={components.magnitude:.2f}",
-        f"snr={components.snr:.2f}",
-        f"interval={components.interval:.2f}",
-    ]
+    source_label = "ARIMA-GARCH" if is_combined else "ARIMA"
+    trigger_parts = [f"{source_label} {arima_direction}"]
+    if is_combined:
+        if volatility_level:
+            trigger_parts.append(f"volatility_level={volatility_level}")
+        if adjusted_snr is not None:
+            trigger_parts.append(f"adjusted_snr={adjusted_snr:.3f}")
+        if garch_volatility is not None:
+            trigger_parts.append(f"garch_vol={garch_volatility:.6f}")
+        if direction != arima_direction:
+            trigger_parts.append(f"aggregation={direction}")
+    trigger_parts.extend(
+        [
+            f"confidence={confidence:.3f}",
+            f"magnitude={components.magnitude:.2f}",
+            f"snr={components.snr:.2f}",
+            f"interval={components.interval:.2f}",
+        ]
+    )
     if is_reversal and should_push:
         trigger_parts.append("direction reversal")
     if rejection_reasons:
@@ -521,6 +589,10 @@ def build_trading_signal(
         components=components,
         arima_direction=arima_direction,
         rejection_reasons=tuple(rejection_reasons),
+        garch_volatility=garch_volatility,
+        volatility_level=volatility_level,
+        aggregation_mode=aggregation_mode,
+        adjusted_snr=adjusted_snr,
     )
 
 
@@ -543,7 +615,7 @@ class SignalEngine:
 
     def evaluate(
         self,
-        prediction: ARIMAPredictionResult,
+        prediction: PredictionInput,
         *,
         symbol: str,
         timestamp_ms: int,
